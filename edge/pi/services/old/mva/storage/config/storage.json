@@ -1,0 +1,12 @@
+cat > ~/mva/storage/config/storage.json <<'JSON'
+{
+  "notes": "This file is not read by current services. Keep here only for future global storage settings.",
+  "db": {
+    "path": "~/mva/data/mva.db",
+    "journal_mode": "WAL",
+    "synchronous": "NORMAL"
+  },
+  "retention_ref": "./retention.json",
+  "thresholds_ref": "./thresholds.json"
+}
+JSON

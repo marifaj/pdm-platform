@@ -1,0 +1,41 @@
+{
+  "model_id": "iforest-edge",
+  "model_ver": "1.0.0",
+  "exported_utc": "2025-11-05T12:55:40Z",
+  "export_run_id": "2e110d8e-30c4-4bd1-9fbf-6a255858bc07",
+  "feature_order": [
+    "vib_rms",
+    "power_w",
+    "temp_c",
+    "rpm"
+  ],
+  "input_dtype": "float32",
+  "preprocessing": {
+    "type": "StandardScaler",
+    "with_mean": true,
+    "with_std": true
+  },
+  "estimator": {
+    "type": "IsolationForest",
+    "n_estimators": 100,
+    "max_samples": 256,
+    "contamination": "auto",
+    "random_state": 42
+  },
+  "score_calibration": {
+    "method": "minmax_then_invert",
+    "train_score_min": -0.6745917201042175,
+    "train_score_max": -0.40325331687927246,
+    "train_score_mean": -0.47759243845939636,
+    "train_score_std": 0.050621964037418365,
+    "formula": "anomaly_score = 1 - clip((score - s_min)/(s_max - s_min), 0, 1)"
+  },
+  "onnx": {
+    "input_name": "input",
+    "target_opset": {
+      "": 15,
+      "ai.onnx.ml": 3
+    },
+    "path": "iforest-v1.onnx"
+  }
+}

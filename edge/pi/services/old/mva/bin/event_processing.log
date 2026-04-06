@@ -1,0 +1,4 @@
+2025-11-07T12:33:46Z event-proc [MQTT] Connected rc=Success; sub mva/gateway/gw-01/pred/+
+2025-11-07T12:33:46Z event-proc [MQTT] Connected rc=Success; sub mva/gateway/gw-01/pred/+
+2025-11-07T12:43:00Z event-proc [SYS] shutting down
+2025-11-07T12:43:00Z event-proc [SYS] shutting down

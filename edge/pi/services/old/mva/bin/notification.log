@@ -1,0 +1,4 @@
+2025-11-07T12:33:47Z notify [MQTT] Connected rc=Success; sub mva/gateway/gw-01/event/+
+2025-11-07T12:33:47Z notify [MQTT] Connected rc=Success; sub mva/gateway/gw-01/event/+
+2025-11-07T12:42:59Z notify [SYS] shutting down
+2025-11-07T12:42:59Z notify [SYS] shutting down

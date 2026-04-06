@@ -1,0 +1,57 @@
+checking telemetry on mosquitto:
+
+mosquitto_sub -v -t 'mva/gateway/gw-01/#'
+mosquitto_pub -h 192.168.178.142 -t mva/gateway/gw-01/ingress/motor-1/cmd -m '{"hz":10}'
+
+FreeRTOS
+run servcies:
+
+bash ./run_all_bg.sh start     # creates/uses .venv, loads .env, starts all, logs to ~/mva/logs/*
+./run_all_bg.sh status
+
+stop services:
+./run_all_bg.sh stop
+
+db:
+sqlite3 ~/mva/data/mva.db '.tables'
+sqlite3 ~/mva/data/mva.db 'SELECT COUNT(*) FROM raw_messages;'
+sqlite3 ~/mva/data/mva.db 'SELECT * FROM events ORDER BY event_id DESC LIMIT 3;'
+sqlite3 ~/mva/data/mva.db 'SELECT * FROM incidents;'
+sqlite3 ~/mva/data/mva.db 'SELECT * FROM notifications ORDER BY notification_id DESC LIMIT 3;'
+
+select count(*) from raw_messages; 
+select count(*) from events;
+select count(*) from notifications;
+select count(*) from incidents;
+
+delete from raw_messages; 
+delete from events;
+delete from notifications;
+delete from incidents;
+
+
+no esp32:
+for i in 1 2 3 4; do
+  mosquitto_pub -t "mva/gateway/gw-01/pred/motor-1" -m '{
+    "schema_ver":"1",
+    "trace_id":"manual-test",
+    "msg_id":"manual-'"$i"'",
+    "device_id":"motor-1",
+    "gateway_id":"gw-01",
+    "ts_utc":"2025-10-29T07:05:00Z",
+    "feature_ver":"v1",
+    "model_id":"iforest-v1",
+    "model_ver":"1.0.0",
+    "anomaly_score":0.95,
+    "is_anomaly_model_hint":true,
+    "inference_ms":1
+  }'
+  sleep 0.4
+done
+
+sqlite3 ~/mva/data/mva.db 'SELECT * FROM notifications ORDER BY notification_id DESC LIMIT 3;'
+sqlite3 ~/mva/data/mva.db 'SELECT * FROM events ORDER BY event_id DESC LIMIT 3;'
+sqlite3 ~/mva/data/mva.db 'SELECT * FROM incidents;'
+
+mosquitto_sub -v -t 'mva/gateway/gw-01/pred/+'
+mosquitto_sub -v -t 'mva/gateway/gw-01/event/+'

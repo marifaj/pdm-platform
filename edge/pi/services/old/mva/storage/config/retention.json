@@ -1,0 +1,12 @@
+cat > ~/mva/storage/config/retention.json <<'JSON'
+{
+  "retention": {
+    "cap_percent_free": 70,
+    "raw_min_hours": 24,
+    "events_min_days": 30,
+    "pred_keep": false
+  },
+  "trim_interval_s": 600,
+  "vacuum_interval_s": 86400
+}
+JSON

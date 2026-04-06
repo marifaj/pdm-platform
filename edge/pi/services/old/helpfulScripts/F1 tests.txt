@@ -1,0 +1,239 @@
+mosquitto_sub -v -t 'mva/gateway/gw-01/#'
+mosquitto_sub -t 'mva/gateway/gw-01/pred/#' -v
+mosquitto_sub  -t 'mva/gateway/gw-01/event/#' -v
+
+============================================================
+1) START MVA SERVICES
+============================================================
+
+sudo systemctl start mosquitto
+sudo systemctl start mva-infer
+sudo systemctl start mva-events
+sudo systemctl start mva-notify   # if you use notifications
+
+systemctl --no-pager --full status mosquitto mva-infer mva-events mva-notify
+
+journalctl -u mva-infer  -n 100 --no-pager
+journalctl -u mva-events -n 100 --no-pager
+
+
+
+============================================================
+2) VERIFY DB SCHEMA
+============================================================
+
+sqlite3 ~/mva/data/mva.db ".tables"
+sqlite3 ~/mva/data/mva.db ".schema raw_messages"
+sqlite3 ~/mva/data/mva.db ".schema pred_messages"
+sqlite3 ~/mva/data/mva.db ".schema events"
+sqlite3 ~/mva/data/mva.db ".schema incidents"
+
+
+============================================================
+3) FLASH NEW ESP32 F1 .INO
+============================================================
+
+- Compile and upload esp32_rate_tuned_f1.ino
+- Open Serial Monitor @ 115200
+- Confirm WiFi + MQTT connected
+
+
+============================================================
+4) LIVE TOPIC MONITORS
+============================================================
+
+# Raw ingress
+mosquitto_sub -h 127.0.0.1 -t "mva/gateway/gw-01/ingress/motor-1/raw" -v
+
+# Predictions
+mosquitto_sub -h 127.0.0.1 -t "mva/gateway/gw-01/pred/motor-1" -v
+
+# Events
+mosquitto_sub -h 127.0.0.1 -t "mva/gateway/gw-01/event/#" -v
+
+
+============================================================
+5) BASELINE CONNECTIVITY TEST
+============================================================
+
+mosquitto_pub -h 192.168.178.142 -t mva/gateway/gw-01/ingress/motor-1/cmd  -m '{"hz":10,"anom_frac":0.0}'
+
+
+============================================================
+6) QUICK FRAME-LEVEL F1 RUN (~100s)
+============================================================
+
+mosquitto_pub -h 192.168.178.142 -t mva/gateway/gw-01/ingress/motor-1/cmd -m '{"hz":10,"anom_frac":0.30,"anom_boost":0.25,"anom_type":0}'
+
+mosquitto_pub -h 192.168.178.142 -t mva/gateway/gw-01/ingress/motor-1/cmd -m '{"hz":10,"anom_frac":0.30}'
+
+# Wait ~100 seconds
+
+
+
+============================================================
+6.1) F1 CALCULATION (threshold τ = 0.80)
+============================================================
+sqlite3 ~/mva/data/mva.db <<'SQL'
+WITH latest AS (
+  SELECT trace_id FROM ground_truth ORDER BY rowid DESC LIMIT 1
+),
+joined AS (
+  SELECT
+    g.msg_id,
+    CASE WHEN g.label IN (1,'1','true','TRUE','anomaly','ANOMALY') THEN 1 ELSE 0 END AS y_true,
+    CASE WHEN COALESCE(p.anomaly_score,0) >= 0.70 THEN 1 ELSE 0 END AS y_pred
+  FROM ground_truth g
+  LEFT JOIN pred_messages p USING (msg_id)
+  WHERE g.trace_id = (SELECT trace_id FROM latest)
+),
+agg AS (
+  SELECT
+    SUM(CASE WHEN y_true=1 AND y_pred=1 THEN 1 ELSE 0 END) AS TP,
+    SUM(CASE WHEN y_true=0 AND y_pred=1 THEN 1 ELSE 0 END) AS FP,
+    SUM(CASE WHEN y_true=1 AND y_pred=0 THEN 1 ELSE 0 END) AS FN,
+    SUM(CASE WHEN y_true=0 AND y_pred=0 THEN 1 ELSE 0 END) AS TN
+  FROM joined
+)
+SELECT
+  TP, FP, FN, TN,
+  ROUND(1.0*TP/NULLIF(TP+FP,0),3) AS precision,
+  ROUND(1.0*TP/NULLIF(TP+FN,0),3) AS recall,
+  ROUND(2.0*TP/NULLIF(2*TP+FP+FN,0),3) AS f1
+FROM agg;
+SQL
+
+
+333|159|0|701|0.677|1.0|0.807
+
+
+
+
+============================================================
+6.2) THRESHOLD SWEEP (0.50 → 0.95)
+============================================================
+
+sqlite3 ~/mva/data/mva.db <<'SQL'
+WITH latest AS (
+  SELECT trace_id FROM ground_truth ORDER BY rowid DESC LIMIT 1
+),
+base AS (
+  SELECT
+    g.device_id,
+    g.msg_id,
+    CASE WHEN g.label IN (1,'1','true','TRUE','anomaly','ANOMALY') THEN 1 ELSE 0 END AS y_true,
+    p.anomaly_score AS score
+  FROM ground_truth g
+  JOIN pred_messages p USING (msg_id)
+  WHERE g.trace_id = (SELECT trace_id FROM latest)
+    AND g.device_id = 'motor-1'
+),
+t(th) AS (
+  VALUES (0.50),(0.55),(0.60),(0.65),(0.70),(0.75),(0.80),(0.85),(0.90),(0.95)
+),
+m AS (
+  SELECT
+    th,
+    SUM(CASE WHEN y_true=1 AND score>=th THEN 1 ELSE 0 END) AS TP,
+    SUM(CASE WHEN y_true=0 AND score>=th THEN 1 ELSE 0 END) AS FP,
+SQLER BY th;3f', 
+
+2.0*TP/NULLIF(2*TP+FP+FN,0))     AS f1call,on,TN,
+0.50|333|159|0|701|0.677|1.000|0.807
+0.55|333|159|0|701|0.677|1.000|0.807
+0.60|333|159|0|701|0.677|1.000|0.807
+0.65|333|159|0|701|0.677|1.000|0.807
+0.70|333|159|0|701|0.677|1.000|0.807
+0.75|0|0|333|860|0.000|0.000|0.000
+0.80|0|0|333|860|0.000|0.000|0.000
+0.85|0|0|333|860|0.000|0.000|0.000
+0.90|0|0|333|860|0.000|0.000|0.000
+0.95|0|0|333|860|0.000|0.000|0.000
+
+
+
+============================================================
+7) EVENT-LEVEL TEST (DETERMINISTIC BURSTS)
+============================================================
+
+mosquitto_pub -h 192.168.178.142 -t mva/gateway/gw-01/ingress/motor-1/cmd  -m '{"hz":10,"anom_frac":0.0,"anom_type":0}'
+sleep 20
+
+mosquitto_pub -h 192.168.178.142 -t mva/gateway/gw-01/ingress/motor-1/cmd  -m '{"burst_frames":10,"burst_boost":0.20}'
+sleep 2
+
+mosquitto_pub -h 192.168.178.142  -t mva/gateway/gw-01/ingress/motor-1/cmd -m '{"burst_frames":10,"burst_boost":0.30}'
+sleep 2
+
+mosquitto_pub -h 192.168.178.142  -t mva/gateway/gw-01/ingress/motor-1/cmd   -m '{"burst_frames":10,"burst_boost":0.40}'
+sleep 2
+
+sleep 20
+
+
+============================================================
+7.1) CHECK EVENTS & INCIDENTS
+============================================================
+
+sqlite3 ~/mva/data/mva.db \
+  "SELECT * FROM incidents ORDER BY opened_at DESC LIMIT 10;"
+
+sqlite3 ~/mva/data/mva.db \
+  "SELECT id,msg_id,device_id,ts_utc,severity,rule_id FROM events ORDER BY id DESC LIMIT 20;"
+
+sqlite3 ~/mva/data/mva.db "SELECT COUNT(*) FROM incidents;"
+sqlite3 ~/mva/data/mva.db "SELECT COUNT(*) FROM events;"
+sqlite3 ~/mva/data/mva.db "SELECT incident_id, status, severity_current, occurrences, opened_at FROM incidents ORDER BY opened_at DESC LIMIT 3;"
+sqlite3 ~/mva/data/mva.db "SELECT event_id, device_id, severity, ts_utc FROM events ORDER BY event_id DESC LIMIT 5;"
+
+============================================================
+8) THROUGHPUT TEST
+============================================================
+
+ts=$(date +%s); mosquitto_sub -h 127.0.0.1 \
+  -t "mva/gateway/gw-01/ingress/motor-1/raw" | \
+  awk -v start="$ts" 'BEGIN{c=0} {c++} (systime()-start)>=10 {print c/10 " msgs/sec"; exit}'
+
+
+============================================================
+9) CPU + MEMORY
+============================================================
+
+top -b -n1 | egrep "mosquitto|python|mva"
+
+
+============================================================
+10) END-TO-END LATENCY
+============================================================
+
+sqlite3 ~/mva/data/mva.db "
+SELECT AVG(received_ms - t_pub_ms) AS avg_ms,
+       MIN(received_ms - t_pub_ms) AS min_ms,
+       MAX(received_ms - t_pub_ms) AS max_ms
+FROM pred_messages
+WHERE device_id='motor-1'
+  AND (received_ms - t_pub_ms) BETWEEN 0 AND 10000;"
+
+
+============================================================
+11) LONG RUN (RECOMMENDED)
+============================================================
+
+# Run ~10,000 frames @ 10 Hz with random anomalies
+mosquitto_pub -h 192.168.178.142 \
+  -t mva/gateway/gw-01/ingress/motor-1/cmd \
+  -m '{"hz":10,"anom_frac":0.30,"anom_boost":0.30}'
+
+# Let run ~17 minutes
+
+
+============================================================
+12) RESET DB (OPTIONAL)
+============================================================
+
+sqlite3 ~/mva/data/mva.db "PRAGMA wal_checkpoint(FULL); VACUUM;"
+
+
+============================================================
+END OF PLAYBOOK
+============================================================

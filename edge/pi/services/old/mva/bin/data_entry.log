@@ -1,0 +1,6 @@
+2025-11-07T12:33:46.204Z data-entry [BOOT] gateway=gw-01 host=127.0.0.1:1883 sub=mva/gateway/gw-01/ingress/+/raw
+2025-11-07T12:33:46.205Z data-entry [MQTT] Connected rc=Success; sub mva/gateway/gw-01/ingress/+/raw
+2025-11-07T12:33:46.204Z data-entry [BOOT] gateway=gw-01 host=127.0.0.1:1883 sub=mva/gateway/gw-01/ingress/+/raw
+2025-11-07T12:33:46.205Z data-entry [MQTT] Connected rc=Success; sub mva/gateway/gw-01/ingress/+/raw
+2025-11-07T12:43:01.705Z data-entry [SYS] shutting down
+2025-11-07T12:43:01.705Z data-entry [SYS] shutting down

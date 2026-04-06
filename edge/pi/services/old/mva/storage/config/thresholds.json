@@ -1,0 +1,16 @@
+cat > ~/mva/storage/config/thresholds.json <<'JSON'
+{
+  "thresholds_by_type": {
+    "motor": {
+      "warn": 0.60,
+      "high": 0.80,
+      "crit": 0.90
+    }
+  },
+  "hysteresis": {
+    "open_N": 3,
+    "resolve_M": 10,
+    "cooldown_s": 600
+  }
+}
+JSON
