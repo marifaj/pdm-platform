@@ -1,6 +1,14 @@
+#include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Wire.h>
+
+// =========================
+// WiFi CONFIG
+// =========================
+const char* ssid = "Klea";
+const char* password = "rinesanart";
 
 // =========================
 // DS18B20 Temperature Sensor
@@ -8,7 +16,6 @@
 // red    -> 3.3V
 // black  -> GND
 // yellow -> GPIO4
-
 #define ONE_WIRE_BUS 4
 
 OneWire oneWire(ONE_WIRE_BUS);
@@ -19,11 +26,10 @@ DallasTemperature tempSensors(&oneWire);
 // =========================
 // VCC -> 3.3V
 // GND -> GND
-// SDA -> GPIO21
-// SCL -> GPIO22
+// SDA  (green) -> GPIO21
+// SCL (yellow) -> GPIO22
 // CS  -> 3.3V
 // SDO -> GND
-
 #define ADXL345_ADDR 0x53
 
 int readingIndex = 1;
@@ -42,7 +48,6 @@ void readRegisters(uint8_t startReg, uint8_t count, uint8_t *data) {
   Wire.beginTransmission(ADXL345_ADDR);
   Wire.write(startReg);
   Wire.endTransmission(false);
-
   Wire.requestFrom(ADXL345_ADDR, count);
 
   uint8_t i = 0;
@@ -51,48 +56,105 @@ void readRegisters(uint8_t startReg, uint8_t count, uint8_t *data) {
   }
 }
 
+// -------------------------
+// WiFi setup
+// -------------------------
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Connected! IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// -------------------------
+// OTA setup
+// -------------------------
+void setupOTA() {
+  ArduinoOTA.setHostname("esp32-temp-vibration");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA update started");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA update finished");
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]\n", error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("OTA ready");
+}
+
+// =========================
+// SETUP
+// =========================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // DS18B20 setup
+  Serial.println("Starting system...");
+
+  // ---- DS18B20 FIRST ----
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
   tempSensors.begin();
 
+  int deviceCount = tempSensors.getDeviceCount();
   Serial.print("DS18B20 device count = ");
-  Serial.println(tempSensors.getDeviceCount());
+  Serial.println(deviceCount);
 
-  // ADXL345 setup
+  if (deviceCount == 0) {
+    Serial.println("WARNING: No DS18B20 detected!");
+  }
+
+  // ---- ADXL345 ----
   Wire.begin(21, 22);
   delay(500);
 
-  // Put ADXL345 into measurement mode
-  writeRegister(0x2D, 0x08);
+  writeRegister(0x2D, 0x08); // measurement mode
+  writeRegister(0x31, 0x08); // full resolution
 
-  // Full resolution, +/-2g
-  writeRegister(0x31, 0x08);
-
-  // Optional: quick ADXL345 presence check
   Wire.beginTransmission(ADXL345_ADDR);
   if (Wire.endTransmission() == 0) {
-    Serial.println("ADXL345 detected and initialized.");
+    Serial.println("ADXL345 OK");
   } else {
-    Serial.println("ADXL345 NOT detected.");
+    Serial.println("ADXL345 NOT detected!");
   }
 
-  Serial.println("Both sensors setup complete.");
+  // ---- WiFi + OTA LAST ----
+  connectWiFi();
+  setupOTA();
+
+  Serial.println("System ready.");
   Serial.println("------------------------------------");
 }
 
+// =========================
+// LOOP
+// =========================
 void loop() {
+  ArduinoOTA.handle();
+
   // =========================
-  // Read temperature
+  // Temperature
   // =========================
   tempSensors.requestTemperatures();
+  delay(100); // important for stability
+
   float tempC = tempSensors.getTempCByIndex(0);
 
   // =========================
-  // Read ADXL345 vibration
+  // Vibration
   // =========================
   uint8_t rawData[6];
   readRegisters(0x32, 6, rawData);
@@ -106,14 +168,20 @@ void loop() {
   float z_g = z * 0.0039;
 
   // =========================
-  // Print all together
+  // OUTPUT
   // =========================
   Serial.print("Reading ");
   Serial.println(readingIndex);
 
-  Serial.print("Temperature (C): ");
-  Serial.println(tempC);
+  // ---- TEMP CHECK ----
+  if (tempC == DEVICE_DISCONNECTED_C) {
+    Serial.println("ERROR: DS18B20 disconnected!");
+  } else {
+    Serial.print("Temperature (C): ");
+    Serial.println(tempC);
+  }
 
+  // ---- VIBRATION ----
   Serial.print("Raw X: ");
   Serial.print(x);
   Serial.print(" | Y: ");
@@ -131,5 +199,6 @@ void loop() {
   Serial.println("------------------------------------");
 
   readingIndex++;
+
   delay(1000);
 }
