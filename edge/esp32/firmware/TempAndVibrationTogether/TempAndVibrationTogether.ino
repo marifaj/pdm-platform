@@ -3,6 +3,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Wire.h>
+#include <PubSubClient.h>
 
 // =========================
 // WiFi CONFIG
@@ -11,11 +12,23 @@ const char* ssid = "Klea";
 const char* password = "rinesanart";
 
 // =========================
+// MQTT CONFIG
+// =========================
+const char* mqttServer = "192.168.178.142";   // <-- PUT YOUR PI4 IP HERE
+const int mqttPort = 1883;
+const char* mqttTopic = "factory/factory-001/machine/machine-001/telemetry";
+const char* mqttClientId = "esp32-001";
+
+// =========================
+// IDs
+// =========================
+const char* factoryId = "factory-001";
+const char* machineId = "machine-001";
+const char* deviceId = "esp32-001";
+
+// =========================
 // DS18B20 Temperature Sensor
 // =========================
-// red    -> 3.3V
-// black  -> GND
-// yellow -> GPIO4
 #define ONE_WIRE_BUS 4
 
 OneWire oneWire(ONE_WIRE_BUS);
@@ -24,15 +37,17 @@ DallasTemperature tempSensors(&oneWire);
 // =========================
 // ADXL345 Vibration Sensor
 // =========================
-// VCC -> 3.3V
-// GND -> GND
-// SDA  (green) -> GPIO21
-// SCL (yellow) -> GPIO22
-// CS  -> 3.3V
-// SDO -> GND
 #define ADXL345_ADDR 0x53
 
+// =========================
+// WiFi / MQTT objects
+// =========================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
 int readingIndex = 1;
+unsigned long lastPublishTime = 0;
+const unsigned long publishIntervalMs = 2000; // publish every 2 seconds
 
 // -------------------------
 // ADXL345 helper functions
@@ -96,6 +111,31 @@ void setupOTA() {
   Serial.println("OTA ready");
 }
 
+// -------------------------
+// MQTT setup
+// -------------------------
+void setupMQTT() {
+  mqttClient.setServer(mqttServer, mqttPort);
+}
+
+// -------------------------
+// MQTT reconnect
+// -------------------------
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT... ");
+
+    if (mqttClient.connect(mqttClientId)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 2 seconds...");
+      delay(2000);
+    }
+  }
+}
+
 // =========================
 // SETUP
 // =========================
@@ -131,9 +171,10 @@ void setup() {
     Serial.println("ADXL345 NOT detected!");
   }
 
-  // ---- WiFi + OTA LAST ----
+  // ---- WiFi + OTA + MQTT ----
   connectWiFi();
   setupOTA();
+  setupMQTT();
 
   Serial.println("System ready.");
   Serial.println("------------------------------------");
@@ -145,60 +186,104 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
 
-  // =========================
-  // Temperature
-  // =========================
-  tempSensors.requestTemperatures();
-  delay(100); // important for stability
-
-  float tempC = tempSensors.getTempCByIndex(0);
-
-  // =========================
-  // Vibration
-  // =========================
-  uint8_t rawData[6];
-  readRegisters(0x32, 6, rawData);
-
-  int16_t x = (int16_t)((rawData[1] << 8) | rawData[0]);
-  int16_t y = (int16_t)((rawData[3] << 8) | rawData[2]);
-  int16_t z = (int16_t)((rawData[5] << 8) | rawData[4]);
-
-  float x_g = x * 0.0039;
-  float y_g = y * 0.0039;
-  float z_g = z * 0.0039;
-
-  // =========================
-  // OUTPUT
-  // =========================
-  Serial.print("Reading ");
-  Serial.println(readingIndex);
-
-  // ---- TEMP CHECK ----
-  if (tempC == DEVICE_DISCONNECTED_C) {
-    Serial.println("ERROR: DS18B20 disconnected!");
-  } else {
-    Serial.print("Temperature (C): ");
-    Serial.println(tempC);
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
   }
 
-  // ---- VIBRATION ----
-  Serial.print("Raw X: ");
-  Serial.print(x);
-  Serial.print(" | Y: ");
-  Serial.print(y);
-  Serial.print(" | Z: ");
-  Serial.println(z);
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
 
-  Serial.print("g X: ");
-  Serial.print(x_g, 3);
-  Serial.print(" | Y: ");
-  Serial.print(y_g, 3);
-  Serial.print(" | Z: ");
-  Serial.println(z_g, 3);
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastPublishTime >= publishIntervalMs) {
+    lastPublishTime = currentMillis;
 
-  Serial.println("------------------------------------");
+    // =========================
+    // Temperature
+    // =========================
+    tempSensors.requestTemperatures();
+    delay(100);
 
-  readingIndex++;
+    float tempC = tempSensors.getTempCByIndex(0);
 
-  delay(1000);
+    // =========================
+    // Vibration
+    // =========================
+    uint8_t rawData[6];
+    readRegisters(0x32, 6, rawData);
+
+    int16_t x = (int16_t)((rawData[1] << 8) | rawData[0]);
+    int16_t y = (int16_t)((rawData[3] << 8) | rawData[2]);
+    int16_t z = (int16_t)((rawData[5] << 8) | rawData[4]);
+
+    float x_g = x * 0.0039;
+    float y_g = y * 0.0039;
+    float z_g = z * 0.0039;
+
+    // =========================
+    // Serial debug
+    // =========================
+    Serial.print("Reading ");
+    Serial.println(readingIndex);
+
+    if (tempC == DEVICE_DISCONNECTED_C) {
+      Serial.println("ERROR: DS18B20 disconnected!");
+    } else {
+      Serial.print("Temperature (C): ");
+      Serial.println(tempC);
+    }
+
+    Serial.print("Raw X: ");
+    Serial.print(x);
+    Serial.print(" | Y: ");
+    Serial.print(y);
+    Serial.print(" | Z: ");
+    Serial.println(z);
+
+    Serial.print("g X: ");
+    Serial.print(x_g, 3);
+    Serial.print(" | Y: ");
+    Serial.print(y_g, 3);
+    Serial.print(" | Z: ");
+    Serial.println(z_g, 3);
+
+    // =========================
+    // Build JSON payload
+    // =========================
+    char payload[256];
+
+    snprintf(
+      payload,
+      sizeof(payload),
+      "{\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%d,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f}",
+      factoryId,
+      machineId,
+      deviceId,
+      readingIndex,
+      tempC,
+      x,
+      y,
+      z,
+      x_g,
+      y_g,
+      z_g
+    );
+
+    // =========================
+    // Publish to MQTT
+    // =========================
+    bool published = mqttClient.publish(mqttTopic, payload);
+
+    if (published) {
+      Serial.println("MQTT publish OK");
+      Serial.println(payload);
+    } else {
+      Serial.println("MQTT publish FAILED");
+    }
+
+    Serial.println("------------------------------------");
+
+    readingIndex++;
+  }
 }
