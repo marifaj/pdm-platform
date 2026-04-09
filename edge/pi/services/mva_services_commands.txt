@@ -1,0 +1,195 @@
+MVA SERVICES — QUICK COMMAND REFERENCE
+
+Location assumptions:
+- Project root: ~/mva
+- Service manager script: ~/mva/services.sh
+
+==================================================
+1) GO TO PROJECT ROOT
+==================================================
+
+cd ~/mva
+
+==================================================
+2) RUN INITIAL SETUP (ONE TIME)
+==================================================
+
+chmod +x ~/mva/setup.sh ~/mva/services.sh
+./setup.sh
+
+==================================================
+3) START ALL SERVICES
+==================================================
+
+cd ~/mva
+./services.sh start
+
+==================================================
+4) STOP ALL SERVICES
+==================================================
+
+cd ~/mva
+./services.sh stop
+
+==================================================
+5) RESTART ALL SERVICES
+==================================================
+
+cd ~/mva
+./services.sh restart
+
+==================================================
+6) CHECK STATUS OF ALL SERVICES
+==================================================
+
+cd ~/mva
+./services.sh status
+
+==================================================
+7) CHECK HEALTH
+==================================================
+
+cd ~/mva
+./services.sh health
+
+==================================================
+8) START ONLY ONE SERVICE
+==================================================
+
+cd ~/mva
+./services.sh start-one ingestion
+
+cd ~/mva
+./services.sh start-one storage
+
+cd ~/mva
+./services.sh start-one inference
+
+cd ~/mva
+./services.sh start-one event_processing
+
+cd ~/mva
+./services.sh start-one notification
+
+==================================================
+9) STOP ONLY ONE SERVICE
+==================================================
+
+cd ~/mva
+./services.sh stop-one ingestion
+
+cd ~/mva
+./services.sh stop-one storage
+
+cd ~/mva
+./services.sh stop-one inference
+
+cd ~/mva
+./services.sh stop-one event_processing
+
+cd ~/mva
+./services.sh stop-one notification
+
+==================================================
+10) VIEW LIVE LOGS FOR ONE SERVICE
+==================================================
+
+cd ~/mva
+./services.sh tail ingestion
+
+cd ~/mva
+./services.sh tail storage
+
+cd ~/mva
+./services.sh tail inference
+
+cd ~/mva
+./services.sh tail event_processing
+
+cd ~/mva
+./services.sh tail notification
+
+==================================================
+11) LIST LOG FILES
+==================================================
+
+cd ~/mva
+./services.sh logs
+
+==================================================
+12) CLEAN LOG FILES
+==================================================
+
+cd ~/mva
+./services.sh logs --clean
+
+==================================================
+13) EXPECTED SERVICE FILE LOCATIONS
+==================================================
+
+~/mva/pi/services/ingestion/app.py
+~/mva/pi/services/storage/app.py
+~/mva/pi/services/inference/app.py
+~/mva/pi/services/event_processing/app.py
+~/mva/pi/services/notification/app.py
+
+==================================================
+14) START ORDER USED BY services.sh
+==================================================
+
+1. storage
+2. ingestion
+3. inference
+4. event_processing
+5. notification
+
+==================================================
+15) STOP ORDER USED BY services.sh
+==================================================
+
+1. notification
+2. event_processing
+3. inference
+4. ingestion
+5. storage
+
+==================================================
+16) IF A SERVICE DOES NOT START
+==================================================
+
+Check status:
+cd ~/mva
+./services.sh status
+
+Check health:
+cd ~/mva
+./services.sh health
+
+View that service log:
+cd ~/mva
+./services.sh tail inference
+
+Replace "inference" with:
+- ingestion
+- storage
+- event_processing
+- notification
+
+==================================================
+17) MOST COMMON DAILY COMMANDS
+==================================================
+
+Start everything:
+cd ~/mva && ./services.sh start
+
+Stop everything:
+cd ~/mva && ./services.sh stop
+
+Restart everything:
+cd ~/mva && ./services.sh restart
+
+Check status:
+cd ~/mva && ./services.sh status
+
+Watch inference logs:
+cd ~/mva && ./services.sh tail inference
