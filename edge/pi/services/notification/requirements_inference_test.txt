@@ -1,0 +1,7 @@
+paho-mqtt
+python-dotenv
+numpy
+onnxruntime
+scikit-learn
+skl2onnx
+onnx
