@@ -6,8 +6,26 @@
 #include <PubSubClient.h>
 
 // =========================
+// DS18B20 Temperature Sensor
+// =========================
+// red    -> 3.3V
+// black  -> GND
+// yellow -> GPIO4
+
+// =========================
+// ADXL345 Vibration Sensor
+// =========================
+// VCC -> 3.3V
+// GND -> GND
+// SDA  (green) -> GPIO21
+// SCL (yellow) -> GPIO22
+// CS  -> 3.3V
+// SDO -> GND
+
+// =========================
 // WiFi CONFIG
 // =========================
+
 const char* ssid = "Klea";
 const char* password = "rinesanart";
 
