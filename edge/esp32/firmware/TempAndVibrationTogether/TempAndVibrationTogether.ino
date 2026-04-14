@@ -5,93 +5,95 @@
 #include <Wire.h>
 #include <PubSubClient.h>
 
-// =========================
-// DS18B20 Temperature Sensor
-// =========================
+// ======================================================
+// SENSOR / WIRING NOTES
+// ======================================================
+// DS18B20
 // red    -> 3.3V
 // black  -> GND
 // yellow -> GPIO4
-
-// =========================
-// ADXL345 Vibration Sensor
-// =========================
+//
+// ADXL345
 // VCC -> 3.3V
 // GND -> GND
-// SDA  (green) -> GPIO21
+// SDA (green) -> GPIO21
 // SCL (yellow) -> GPIO22
 // CS  -> 3.3V
 // SDO -> GND
+//
+// IMPORTANT:
+// - ADXL345 is configured for FULL_RES + +/-2g
+// - scale factor = 3.9 mg/LSB = 0.0039 g/LSB
 
-// =========================
-// WiFi CONFIG
-// =========================
-
+// ======================================================
+// WIFI CONFIG
+// ======================================================
 const char* ssid = "Klea";
 const char* password = "rinesanart";
 
-// =========================
+// ======================================================
 // MQTT CONFIG
-// =========================
-const char* mqttServer = "192.168.178.142";   // <-- PUT YOUR PI4 IP HERE
+// ======================================================
+const char* mqttServer = "192.168.178.142";   // Pi4 IP
 const int mqttPort = 1883;
 const char* mqttTopic = "factory/factory-001/machine/machine-001/telemetry";
 const char* mqttClientId = "esp32-001";
 
-// =========================
+// ======================================================
 // IDs
-// =========================
+// ======================================================
 const char* factoryId = "factory-001";
 const char* machineId = "machine-001";
 const char* deviceId = "esp32-001";
 
-// =========================
-// DS18B20 Temperature Sensor
-// =========================
+// ======================================================
+// DS18B20
+// ======================================================
 #define ONE_WIRE_BUS 4
-
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensors(&oneWire);
 
-// =========================
-// ADXL345 Vibration Sensor
-// =========================
+// ======================================================
+// ADXL345
+// ======================================================
 #define ADXL345_ADDR 0x53
+#define ADXL345_DEVID_REG 0x00
+#define ADXL345_POWER_CTL 0x2D
+#define ADXL345_DATA_FORMAT 0x31
+#define ADXL345_BW_RATE 0x2C
+#define ADXL345_DATAX0 0x32
 
-// =========================
-// WiFi / MQTT objects
-// =========================
+const float ADXL345_SCALE_G_PER_LSB = 0.0039f; // full-res +/-2g
+
+// ======================================================
+// WIFI / MQTT OBJECTS
+// ======================================================
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-int readingIndex = 1;
+// ======================================================
+// TIMING
+// ======================================================
+// Publish accelerometer data at 100 Hz
+const unsigned long publishIntervalMs = 10000;
+
+// Read temperature asynchronously every 1 second
+const unsigned long tempRequestIntervalMs = 1000;
+const unsigned long tempConversionWaitMs = 800; // safe for 12-bit DS18B20
+
 unsigned long lastPublishTime = 0;
-const unsigned long publishIntervalMs = 2000; // publish every 2 seconds
+unsigned long lastTempRequestTime = 0;
+bool tempConversionInProgress = false;
 
-// -------------------------
-// ADXL345 helper functions
-// -------------------------
-void writeRegister(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(ADXL345_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-}
+// ======================================================
+// STATE
+// ======================================================
+uint32_t readingIndex = 1;
+float latestTempC = NAN;
 
-void readRegisters(uint8_t startReg, uint8_t count, uint8_t *data) {
-  Wire.beginTransmission(ADXL345_ADDR);
-  Wire.write(startReg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(ADXL345_ADDR, count);
-
-  uint8_t i = 0;
-  while (Wire.available() && i < count) {
-    data[i++] = Wire.read();
-  }
-}
-
-// -------------------------
-// WiFi setup
-// -------------------------
+// ======================================================
+// HELPERS
+// ======================================================
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -103,13 +105,10 @@ void connectWiFi() {
   }
 
   Serial.println();
-  Serial.print("Connected! IP: ");
+  Serial.print("Connected. IP: ");
   Serial.println(WiFi.localIP());
 }
 
-// -------------------------
-// OTA setup
-// -------------------------
 void setupOTA() {
   ArduinoOTA.setHostname("esp32-temp-vibration");
 
@@ -129,16 +128,11 @@ void setupOTA() {
   Serial.println("OTA ready");
 }
 
-// -------------------------
-// MQTT setup
-// -------------------------
 void setupMQTT() {
   mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setBufferSize(512);
 }
 
-// -------------------------
-// MQTT reconnect
-// -------------------------
 void reconnectMQTT() {
   while (!mqttClient.connected()) {
     Serial.print("Connecting to MQTT... ");
@@ -154,53 +148,174 @@ void reconnectMQTT() {
   }
 }
 
-// =========================
-// SETUP
-// =========================
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
+// ======================================================
+// ADXL345 LOW-LEVEL FUNCTIONS
+// ======================================================
+bool writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
 
-  Serial.println("Starting system...");
+bool readRegister(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
 
-  // ---- DS18B20 FIRST ----
+  uint8_t received = Wire.requestFrom((uint8_t)ADXL345_ADDR, (uint8_t)1);
+  if (received != 1) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+bool readRegisters(uint8_t startReg, uint8_t count, uint8_t *data) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(startReg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t received = Wire.requestFrom((uint8_t)ADXL345_ADDR, count);
+  if (received != count) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    data[i] = Wire.read();
+  }
+
+  return true;
+}
+
+bool setupADXL345() {
+  uint8_t devid = 0;
+  if (!readRegister(ADXL345_DEVID_REG, devid)) {
+    Serial.println("ERROR: Failed to read ADXL345 DEVID");
+    return false;
+  }
+
+  Serial.print("ADXL345 DEVID = 0x");
+  Serial.println(devid, HEX);
+
+  if (devid != 0xE5) {
+    Serial.println("ERROR: Unexpected ADXL345 device ID");
+    return false;
+  }
+
+  // Standby before configuration
+  if (!writeRegister(ADXL345_POWER_CTL, 0x00)) return false;
+
+  // Full resolution, +/-2g
+  if (!writeRegister(ADXL345_DATA_FORMAT, 0x08)) return false;
+
+  // 100 Hz output data rate
+  if (!writeRegister(ADXL345_BW_RATE, 0x0A)) return false;
+
+  // Measurement mode
+  if (!writeRegister(ADXL345_POWER_CTL, 0x08)) return false;
+
+  delay(100);
+  return true;
+}
+
+bool readADXL345(int16_t &x, int16_t &y, int16_t &z) {
+  uint8_t rawData[6] = {0};
+
+  if (!readRegisters(ADXL345_DATAX0, 6, rawData)) {
+    return false;
+  }
+
+  x = (int16_t)((rawData[1] << 8) | rawData[0]);
+  y = (int16_t)((rawData[3] << 8) | rawData[2]);
+  z = (int16_t)((rawData[5] << 8) | rawData[4]);
+
+  return true;
+}
+
+// ======================================================
+// DS18B20 HELPERS
+// ======================================================
+void setupDS18B20() {
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
   tempSensors.begin();
+  tempSensors.setWaitForConversion(false);  // non-blocking
 
   int deviceCount = tempSensors.getDeviceCount();
   Serial.print("DS18B20 device count = ");
   Serial.println(deviceCount);
 
   if (deviceCount == 0) {
-    Serial.println("WARNING: No DS18B20 detected!");
+    Serial.println("WARNING: No DS18B20 detected");
   }
 
-  // ---- ADXL345 ----
-  Wire.begin(21, 22);
-  delay(500);
+  // Start first async conversion
+  tempSensors.requestTemperatures();
+  lastTempRequestTime = millis();
+  tempConversionInProgress = true;
+}
 
-  writeRegister(0x2D, 0x08); // measurement mode
-  writeRegister(0x31, 0x08); // full resolution
+void updateTemperatureAsync() {
+  unsigned long now = millis();
 
-  Wire.beginTransmission(ADXL345_ADDR);
-  if (Wire.endTransmission() == 0) {
-    Serial.println("ADXL345 OK");
+  if (tempConversionInProgress) {
+    if (now - lastTempRequestTime >= tempConversionWaitMs) {
+      float t = tempSensors.getTempCByIndex(0);
+      if (t != DEVICE_DISCONNECTED_C) {
+        latestTempC = t;
+      } else {
+        Serial.println("WARNING: DS18B20 disconnected or invalid reading");
+      }
+
+      tempSensors.requestTemperatures();
+      lastTempRequestTime = now;
+    }
   } else {
-    Serial.println("ADXL345 NOT detected!");
+    tempSensors.requestTemperatures();
+    lastTempRequestTime = now;
+    tempConversionInProgress = true;
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Starting system...");
+
+  // Sensors
+  setupDS18B20();
+
+  Wire.begin(21, 22);
+  delay(200);
+
+  if (!setupADXL345()) {
+    Serial.println("FATAL: ADXL345 setup failed");
+  } else {
+    Serial.println("ADXL345 initialized successfully");
   }
 
-  // ---- WiFi + OTA + MQTT ----
+  // Network and services
   connectWiFi();
   setupOTA();
   setupMQTT();
 
-  Serial.println("System ready.");
+  Serial.println("System ready");
   Serial.println("------------------------------------");
 }
 
-// =========================
+// ======================================================
 // LOOP
-// =========================
+// ======================================================
 void loop() {
   ArduinoOTA.handle();
 
@@ -213,73 +328,37 @@ void loop() {
   }
   mqttClient.loop();
 
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastPublishTime >= publishIntervalMs) {
-    lastPublishTime = currentMillis;
+  // Update temperature asynchronously
+  updateTemperatureAsync();
 
-    // =========================
-    // Temperature
-    // =========================
-    tempSensors.requestTemperatures();
-    delay(100);
+  // Publish accelerometer + latest temperature at 100 Hz
+  unsigned long now = millis();
+  if (now - lastPublishTime >= publishIntervalMs) {
+    lastPublishTime = now;
 
-    float tempC = tempSensors.getTempCByIndex(0);
-
-    // =========================
-    // Vibration
-    // =========================
-    uint8_t rawData[6];
-    readRegisters(0x32, 6, rawData);
-
-    int16_t x = (int16_t)((rawData[1] << 8) | rawData[0]);
-    int16_t y = (int16_t)((rawData[3] << 8) | rawData[2]);
-    int16_t z = (int16_t)((rawData[5] << 8) | rawData[4]);
-
-    float x_g = x * 0.0039;
-    float y_g = y * 0.0039;
-    float z_g = z * 0.0039;
-
-    // =========================
-    // Serial debug
-    // =========================
-    Serial.print("Reading ");
-    Serial.println(readingIndex);
-
-    if (tempC == DEVICE_DISCONNECTED_C) {
-      Serial.println("ERROR: DS18B20 disconnected!");
-    } else {
-      Serial.print("Temperature (C): ");
-      Serial.println(tempC);
+    int16_t x = 0, y = 0, z = 0;
+    if (!readADXL345(x, y, z)) {
+      Serial.println("ERROR: Failed to read ADXL345 data");
+      return;
     }
 
-    Serial.print("Raw X: ");
-    Serial.print(x);
-    Serial.print(" | Y: ");
-    Serial.print(y);
-    Serial.print(" | Z: ");
-    Serial.println(z);
+    float x_g = x * ADXL345_SCALE_G_PER_LSB;
+    float y_g = y * ADXL345_SCALE_G_PER_LSB;
+    float z_g = z * ADXL345_SCALE_G_PER_LSB;
 
-    Serial.print("g X: ");
-    Serial.print(x_g, 3);
-    Serial.print(" | Y: ");
-    Serial.print(y_g, 3);
-    Serial.print(" | Z: ");
-    Serial.println(z_g, 3);
+    // If temperature not yet available, publish sentinel
+    float tempToSend = isnan(latestTempC) ? -127.0f : latestTempC;
 
-    // =========================
-    // Build JSON payload
-    // =========================
-    char payload[256];
-
+    char payload[320];
     snprintf(
       payload,
       sizeof(payload),
-      "{\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%d,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f}",
+      "{\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f}",
       factoryId,
       machineId,
       deviceId,
-      readingIndex,
-      tempC,
+      (unsigned long)readingIndex,
+      tempToSend,
       x,
       y,
       z,
@@ -288,20 +367,24 @@ void loop() {
       z_g
     );
 
-    // =========================
-    // Publish to MQTT
-    // =========================
-    bool published = mqttClient.publish(mqttTopic, payload);
+    bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      Serial.println("MQTT publish OK");
-      Serial.println(payload);
+      if (readingIndex % 50 == 0) {
+        Serial.print("Published reading ");
+        Serial.print(readingIndex);
+        Serial.print(" | TempC=");
+        Serial.print(tempToSend, 2);
+        Serial.print(" | Xg=");
+        Serial.print(x_g, 3);
+        Serial.print(" | Yg=");
+        Serial.print(y_g, 3);
+        Serial.print(" | Zg=");
+        Serial.println(z_g, 3);
+      }
+      readingIndex++;
     } else {
       Serial.println("MQTT publish FAILED");
     }
-
-    Serial.println("------------------------------------");
-
-    readingIndex++;
   }
 }
