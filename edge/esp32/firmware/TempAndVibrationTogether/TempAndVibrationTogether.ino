@@ -75,7 +75,7 @@ PubSubClient mqttClient(espClient);
 // TIMING
 // ======================================================
 // Publish accelerometer data at 100 Hz
-const unsigned long publishIntervalMs = 10000;
+const unsigned long publishIntervalMs = 10;
 
 // Read temperature asynchronously every 1 second
 const unsigned long tempRequestIntervalMs = 1000;
