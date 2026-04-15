@@ -1,268 +1,333 @@
 #!/usr/bin/env python3
-"""
-Inference Service — temp + vibration only (test version)
 
-Input payload expected from ingestion (flat normalized JSON):
-{
-  "factory_id": "factory-001",
-  "machine_id": "machine-001",
-  "device_id": "esp32-001",
-  "reading_index": 2507,
-  "ts_gateway": "2026-04-09T09:20:00.000Z",
-  "temperature_c": 23.56,
-  "vibration_mag_g": 0.907
-}
-
-Behavior:
-- If ~/mva/models/iforest-temp-vibration-v1.onnx exists and onnxruntime is installed,
-  run ONNX inference first.
-- Else fallback to EWMA + z-score heuristic.
-- Publishes prediction to: mva/gateway/{gateway_id}/pred/{device_id}
-
-This is a TEST service. Replace the ONNX file later with the real trained one.
-"""
-import os, json, time, signal, sys, math
-from collections import defaultdict
+import json
+import math
+import os
+import signal
+import sys
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+import joblib
 import numpy as np
 import paho.mqtt.client as mqtt
 
-# ===== env auto-load (.env) =====
+# ---- optional .env auto-load ----
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # type: ignore
     env_path = Path.home() / "mva" / ".env"
     if env_path.exists():
         load_dotenv(env_path)
 except Exception:
     pass
 
-# ===== config =====
-GATEWAY_ID   = os.getenv("GATEWAY_ID", "gw-01")
-MQTT_HOST    = os.getenv("MQTT_HOST", "127.0.0.1")
-MQTT_PORT    = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USER    = os.getenv("MQTT_USER", "")
-MQTT_PASS    = os.getenv("MQTT_PASS", "")
 
-# Change this if your ingestion publishes somewhere else
-INGRESS_TPL  = os.getenv("INFERENCE_INPUT_TOPIC", f"mva/gateway/{GATEWAY_ID}/ingestion/normalized")
-PRED_TPL     = os.getenv("INFERENCE_OUTPUT_TOPIC", f"mva/gateway/{GATEWAY_ID}/pred/{{device_id}}")
+# ============================================================
+# CONFIG
+# ============================================================
+MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 
-MODEL_ID     = "iforest-temp-vibration-v1"
-MODEL_VER    = "0.1.0-test"
-LOG_PATH     = os.path.expanduser("~/mva/logs/inference.log")
-MODEL_PATH   = Path.home() / "mva" / "models" / "iforest-temp-vibration-v1.onnx"
+INPUT_TOPIC = os.getenv("INFERENCE_INPUT_TOPIC", "mva/normalized/telemetry")
+OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
-# Fallback EWMA params
-ALPHA        = float(os.getenv("EWMA_ALPHA", "0.10"))
-MIN_SAMPLES  = int(os.getenv("EWMA_MIN_SAMPLES", "20"))
-HINT_THRESH  = float(os.getenv("ANOMALY_HINT_THRESHOLD", "0.80"))
+MODEL_PATH = os.path.expanduser(os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/if_model.joblib"))
+LOG_PATH = os.path.expanduser("~/mva/logs/inference.log")
 
-FEATS = ("temperature_c", "vibration_mag_g")
+FEATURE_COLUMNS = [
+    "temperature_c",
+    "x_g",
+    "y_g",
+    "z_g",
+    "vibration_mag_g",
+]
 
+# ---- EWMA parameters ----
+# Lower alpha = smoother EWMA; 0.05 to 0.2 is a reasonable starting range
+EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.10"))
+
+# How many recent residuals to keep for z-score calculation
+EWMA_WINDOW_SIZE = int(os.getenv("EWMA_WINDOW_SIZE", "200"))
+
+# Z-score threshold for temperature anomaly
+EWMA_Z_THRESHOLD = float(os.getenv("EWMA_Z_THRESHOLD", "3.0"))
+
+# Minimum residual std to avoid division by zero / unstable tiny std
+EWMA_MIN_STD = float(os.getenv("EWMA_MIN_STD", "0.05"))
+
+# If true, final anomaly if either ML or EWMA says anomaly
+HYBRID_USE_OR = os.getenv("HYBRID_USE_OR", "true").lower() == "true"
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
-def iso_now():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def log(line):
-    s = f"{iso_now()} inference {line}"
-    print(s, flush=True)
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def log(msg: str) -> None:
+    line = f"{now_iso()} inference {msg}"
+    print(line, flush=True)
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(s + "\n")
+            f.write(line + "\n")
     except Exception:
         pass
 
-# ===== optional ONNX runtime =====
-use_onnx = False
-sess = None
-input_name = None
-output_names = []
 
-if MODEL_PATH.exists():
-    try:
-        import onnxruntime as ort
-        sess = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
-        input_name = sess.get_inputs()[0].name
-        output_names = [o.name for o in sess.get_outputs()]
-        use_onnx = True
-        log(f"[BOOT] ONNX model loaded: {MODEL_PATH}")
-        log(f"[BOOT] ONNX input={input_name} outputs={output_names}")
-    except Exception as e:
-        log(f"[WARN] ONNX init failed, using EWMA fallback only: {e}")
-else:
-    log(f"[BOOT] No ONNX file at {MODEL_PATH}; using EWMA fallback only")
+# ============================================================
+# MODEL LOADING
+# ============================================================
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+    model = joblib.load(MODEL_PATH)
+    log(f"[BOOT] model loaded from {MODEL_PATH}")
+    return model
 
-# ===== EWMA fallback state =====
-class EWMAState:
-    def __init__(self):
-        self.n = 0
-        self.mean = {k: None for k in FEATS}
-        self.var = {k: 0.0 for k in FEATS}
 
-state = defaultdict(EWMAState)
+try:
+    model = load_model()
+except Exception as e:
+    log(f"[FATAL] failed to load model: {e}")
+    raise
 
-def update_ewma(s: EWMAState, sample: dict):
-    for k in FEATS:
-        x = sample.get(k)
-        if x is None:
-            continue
-        x = float(x)
-        if s.mean[k] is None:
-            s.mean[k] = x
-            s.var[k] = 0.0
+
+# ============================================================
+# EWMA STATE
+# ============================================================
+class EWMATemperatureMonitor:
+    def __init__(self, alpha: float, window_size: int, z_threshold: float, min_std: float):
+        self.alpha = alpha
+        self.window_size = window_size
+        self.z_threshold = z_threshold
+        self.min_std = min_std
+
+        self.ewma = None
+        self.residuals = deque(maxlen=window_size)
+
+    def update(self, temp_c: float):
+        """
+        Returns:
+            temp_ewma, residual, zscore, is_anomaly_ewma
+        """
+        if self.ewma is None:
+            self.ewma = temp_c
+            residual = 0.0
+            self.residuals.append(residual)
+            return self.ewma, residual, 0.0, 0
+
+        # Update EWMA
+        self.ewma = self.alpha * temp_c + (1.0 - self.alpha) * self.ewma
+        residual = temp_c - self.ewma
+
+        # Compute z-score based on residual history
+        if len(self.residuals) >= 10:
+            mean_res = float(np.mean(self.residuals))
+            std_res = float(np.std(self.residuals))
+            std_res = max(std_res, self.min_std)
+            zscore = (residual - mean_res) / std_res
         else:
-            s.mean[k] = ALPHA * x + (1 - ALPHA) * s.mean[k]
-            s.var[k] = ALPHA * (x - s.mean[k]) ** 2 + (1 - ALPHA) * s.var[k]
-    s.n += 1
+            zscore = 0.0
 
-def zscore(x: float, mu, var: float) -> float:
-    if mu is None:
-        return 0.0
-    sd = math.sqrt(max(var, 1e-9))
-    return abs((x - mu) / sd)
+        self.residuals.append(residual)
+        is_anomaly = 1 if abs(zscore) >= self.z_threshold else 0
 
-def score_ewma(s: EWMAState, sample: dict) -> float:
-    # More weight on vibration, less on temperature
-    parts = []
-    weights = {
-        "temperature_c": 0.35,
-        "vibration_mag_g": 0.65,
-    }
-    for k in FEATS:
-        v = sample.get(k)
-        if v is None or s.mean[k] is None:
-            continue
-        z = zscore(float(v), s.mean[k], s.var[k])
-        parts.append(min(10.0, z) * weights[k])
+        return self.ewma, residual, zscore, is_anomaly
 
-    if not parts:
-        return 0.0
 
-    raw = sum(parts)
-    score = 1.0 / (1.0 + math.exp(-(raw - 2.0)))
+temp_monitor = EWMATemperatureMonitor(
+    alpha=EWMA_ALPHA,
+    window_size=EWMA_WINDOW_SIZE,
+    z_threshold=EWMA_Z_THRESHOLD,
+    min_std=EWMA_MIN_STD,
+)
 
-    # warm-up damping
-    warm = min(1.0, max(0.0, s.n / float(MIN_SAMPLES)))
-    score *= warm
-    return max(0.0, min(1.0, score))
 
-def build_feature_vector(d: dict) -> np.ndarray:
-    vals = []
-    for k in FEATS:
-        v = d.get(k, np.nan)
-        vals.append(float(v) if v is not None else np.nan)
-    return np.array([vals], dtype=np.float32)
+# ============================================================
+# FEATURE EXTRACTION
+# ============================================================
+def validate_payload(d: dict):
+    required = [
+        "factory_id",
+        "machine_id",
+        "device_id",
+        "reading_index",
+        "ts_gateway",
+        "temperature_c",
+        "x_g",
+        "y_g",
+        "z_g",
+        "vibration_mag_g",
+    ]
+    for k in required:
+        if k not in d:
+            return False, f"missing field: {k}"
+    return True, "ok"
 
-def run_onnx_score(x: np.ndarray) -> float:
+
+def extract_features(d: dict):
+    try:
+        vals = np.array(
+            [
+                float(d["temperature_c"]),
+                float(d["x_g"]),
+                float(d["y_g"]),
+                float(d["z_g"]),
+                float(d["vibration_mag_g"]),
+            ],
+            dtype=float,
+        ).reshape(1, -1)
+        return vals
+    except Exception as e:
+        log(f"[WARN] feature extraction failed: {e}")
+        return None
+
+
+# ============================================================
+# INFERENCE LOGIC
+# ============================================================
+def run_ml_inference(X: np.ndarray):
     """
-    Expected exported ONNX behavior:
-    - Input shape: [1, 2] float32
-    - Output[0] contains decision_function or anomaly score-like value
-
-    For test-time robustness:
-    - If output is already in [0,1], use it directly.
-    - Otherwise assume it's a decision_function where lower = more anomalous,
-      and map to anomaly_score via sigmoid(-value).
+    Isolation Forest:
+    - decision_function: higher = more normal, lower = more anomalous
+    - predict: 1 = normal, -1 = anomaly
     """
-    y = sess.run(output_names, {input_name: x})
+    score = float(model.decision_function(X)[0])
+    pred = int(model.predict(X)[0])
+    is_anomaly_ml = 1 if pred == -1 else 0
+    return score, pred, is_anomaly_ml
 
-    # Prefer first output
-    first = y[0]
-    val = float(first[0]) if np.ndim(first) == 1 else float(first[0][0])
 
-    if 0.0 <= val <= 1.0:
-        score = val
+def combine_decision(is_anomaly_ml: int, is_anomaly_ewma: int):
+    if HYBRID_USE_OR:
+        is_final = 1 if (is_anomaly_ml or is_anomaly_ewma) else 0
     else:
-        score = 1.0 / (1.0 + math.exp(val))
+        is_final = 1 if (is_anomaly_ml and is_anomaly_ewma) else 0
 
-    return max(0.0, min(1.0, score))
+    if is_anomaly_ml and is_anomaly_ewma:
+        reason = "ml_and_ewma"
+    elif is_anomaly_ml:
+        reason = "ml_only"
+    elif is_anomaly_ewma:
+        reason = "ewma_only"
+    else:
+        reason = "normal"
 
-# ===== MQTT handlers =====
-def on_connect(client, userdata, flags, rc, props=None):
-    log(f"[MQTT] connected rc={rc}; sub {INGRESS_TPL}")
-    client.subscribe(INGRESS_TPL, qos=0)
+    return is_final, reason
 
-def on_disconnect(client, userdata, rc, props=None):
-    log(f"[MQTT] disconnected rc={rc}")
+
+# ============================================================
+# MQTT CALLBACKS
+# ============================================================
+def on_connect(client, userdata, flags, rc, properties=None):
+    log(f"[MQTT] connected rc={rc}")
+    client.subscribe(INPUT_TOPIC, qos=1)
+    log(f"[MQTT] subscribed to {INPUT_TOPIC}")
+
 
 def on_message(client, userdata, msg):
-    t0 = time.perf_counter()
-
     try:
-        d = json.loads(msg.payload.decode("utf-8", errors="replace"))
+        payload = msg.payload.decode("utf-8", errors="replace")
+        d = json.loads(payload)
     except Exception as e:
-        log(f"[WARN] invalid JSON: {e}")
+        log(f"[WARN] invalid json: {e}")
         return
 
-    device_id = d.get("device_id", "unknown")
-    ewma_state = state[device_id]
+    ok, why = validate_payload(d)
+    if not ok:
+        log(f"[WARN] invalid normalized payload: {why}")
+        return
 
-    sample = {
-        "temperature_c": d.get("temperature_c"),
-        "vibration_mag_g": d.get("vibration_mag_g"),
-    }
+    X = extract_features(d)
+    if X is None:
+        return
 
-    x = build_feature_vector(sample)
+    try:
+        # ---- ML ----
+        if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
 
-    model_mode = "ewma"
-    score = None
+        # ---- EWMA on temperature ----
+        temp_c = float(d["temperature_c"])
+        temp_ewma, temp_residual, temp_zscore, is_anomaly_ewma = temp_monitor.update(temp_c)
 
-    if use_onnx and not np.isnan(x).any():
-        try:
-            score = run_onnx_score(x)
-            model_mode = "onnx"
-        except Exception as e:
-            log(f"[WARN] ONNX inference failed for device={device_id}; fallback to EWMA: {e}")
+        # ---- Hybrid final decision ----
+        is_anomaly_final, anomaly_reason = combine_decision(
+            is_anomaly_ml=is_anomaly_ml,
+            is_anomaly_ewma=is_anomaly_ewma,
+        )
 
-    if score is None:
-        update_ewma(ewma_state, sample)
-        score = score_ewma(ewma_state, sample)
+        result = {
+            "ts_inference": now_iso(),
+            "factory_id": d["factory_id"],
+            "machine_id": d["machine_id"],
+            "device_id": d["device_id"],
+            "reading_index": int(d["reading_index"]),
+            "ts_gateway": d["ts_gateway"],
 
-    out = {
-        "factory_id": d.get("factory_id"),
-        "machine_id": d.get("machine_id"),
-        "device_id": device_id,
-        "reading_index": d.get("reading_index"),
-        "ts_gateway": d.get("ts_gateway"),
-        "ts_inference": iso_now(),
-        "model_id": MODEL_ID if model_mode == "onnx" else "ewma-temp-vibration-v1",
-        "model_ver": MODEL_VER if model_mode == "onnx" else "0.1.0-test",
-        "mode": model_mode,
-        "features_used": {
-            "temperature_c": sample["temperature_c"],
-            "vibration_mag_g": sample["vibration_mag_g"],
-        },
-        "anomaly_score": round(float(score), 4),
-        "is_anomaly": bool(score >= HINT_THRESH),
-        "inference_ms": int((time.perf_counter() - t0) * 1000),
-    }
+            # raw normalized telemetry
+            "temperature_c": temp_c,
+            "x_g": float(d["x_g"]),
+            "y_g": float(d["y_g"]),
+            "z_g": float(d["z_g"]),
+            "vibration_mag_g": float(d["vibration_mag_g"]),
 
-    topic = PRED_TPL.format(device_id=device_id)
-    client.publish(topic, json.dumps(out, separators=(",", ":")), qos=0, retain=False)
-    log(f"[PUB] mode={model_mode} dev={device_id} score={out['anomaly_score']} topic={topic}")
+            # ML output
+            "if_score": if_score,
+            "if_pred": if_pred,
+            "is_anomaly_ml": is_anomaly_ml,
 
+            # EWMA output
+            "temp_ewma": round(float(temp_ewma), 6),
+            "temp_residual": round(float(temp_residual), 6),
+            "temp_zscore": round(float(temp_zscore), 6),
+            "is_anomaly_ewma": is_anomaly_ewma,
+
+            # final decision
+            "is_anomaly_final": is_anomaly_final,
+            "anomaly_reason": anomaly_reason,
+        }
+
+        client.publish(OUTPUT_TOPIC, json.dumps(result), qos=0, retain=False)
+
+        if int(d["reading_index"]) % 100 == 0:
+            log(
+                f"[INF] idx={d['reading_index']} "
+                f"if_score={if_score:.4f} "
+                f"ml={is_anomaly_ml} "
+                f"ewma={is_anomaly_ewma} "
+                f"final={is_anomaly_final} "
+                f"reason={anomaly_reason}"
+            )
+
+    except Exception as e:
+        log(f"[ERROR] inference failed: {e}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     client = mqtt.Client(
-        client_id=f"inference-{GATEWAY_ID}",
+        client_id="inference-service",
         protocol=mqtt.MQTTv311,
-        transport="tcp",
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )
-
-    if MQTT_USER:
-        client.username_pw_set(MQTT_USER, MQTT_PASS)
-
     client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.loop_start()
 
     def shutdown(signum, frame):
         log("[SYS] shutting down")
+        client.loop_stop()
         try:
             client.disconnect()
         except Exception:
@@ -272,7 +337,10 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    client.loop_forever()
+    log("[BOOT] Inference service up")
+    while True:
+        time.sleep(1)
+
 
 if __name__ == "__main__":
     main()
