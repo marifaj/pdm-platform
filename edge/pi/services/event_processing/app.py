@@ -38,6 +38,8 @@ OPEN_N = int(os.getenv("EVENT_OPEN_N", "3"))          # consecutive anomaly mess
 RESOLVE_M = int(os.getenv("EVENT_RESOLVE_M", "10"))   # consecutive normal messages to resolve
 COOLDOWN_S = int(os.getenv("EVENT_COOLDOWN_S", "60")) # after resolution, pause re-open for this many seconds
 
+DEBUG_LOG_EVERY_MESSAGE = os.getenv("EVENT_DEBUG_EVERY_MESSAGE", "true").lower() == "true"
+
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
@@ -210,7 +212,6 @@ def severity_rank(sev: str) -> int:
 def severity_from_result(d: dict) -> str:
     """
     Simple severity mapping for the hybrid output.
-    Adjust later if needed.
     """
     reason = d.get("anomaly_reason", "normal")
     is_final = int(d.get("is_anomaly_final", 0))
@@ -358,70 +359,75 @@ def upsert_incident(con, d: dict, severity: str):
                 payload_json,
             ),
         )
-    else:
+        con.commit()
+        return incident_id, "OPENED"
+
+    (
+        _incident_id,
+        status,
+        _severity_current,
+        severity_peak,
+        occurrences,
+        _opened_at,
+        _last_seen_at,
+        _resolved_at,
+        _reading_index_first,
+        _reading_index_last,
+        if_score_min,
+        if_score_max,
+        temp_zscore_max,
+        _anomaly_reason_first,
+        _anomaly_reason_last,
+    ) = row
+
+    severity_peak_new = severity_peak
+    if severity_rank(severity) > severity_rank(severity_peak):
+        severity_peak_new = severity
+
+    action = "UPDATED"
+    if status != "OPEN":
+        action = "REOPENED"
+
+    con.execute(
+        """
+        UPDATE incidents
+        SET status = ?,
+            severity_current = ?,
+            severity_peak = ?,
+            anomaly_reason_last = ?,
+            last_seen_at = ?,
+            resolved_at = ?,
+            occurrences = ?,
+            reading_index_last = ?,
+            if_score_min = ?,
+            if_score_max = ?,
+            temp_zscore_max = ?,
+            payload_json = ?
+        WHERE incident_id = ?
+        """,
         (
-            _incident_id,
-            status,
-            severity_current,
-            severity_peak,
-            occurrences,
-            opened_at,
-            last_seen_at,
-            resolved_at,
-            reading_index_first,
-            reading_index_last,
-            if_score_min,
-            if_score_max,
-            temp_zscore_max,
-            anomaly_reason_first,
-            anomaly_reason_last,
-        ) = row
-
-        severity_peak_new = severity_peak
-        if severity_rank(severity) > severity_rank(severity_peak):
-            severity_peak_new = severity
-
-        con.execute(
-            """
-            UPDATE incidents
-            SET status = ?,
-                severity_current = ?,
-                severity_peak = ?,
-                anomaly_reason_last = ?,
-                last_seen_at = ?,
-                resolved_at = ?,
-                occurrences = ?,
-                reading_index_last = ?,
-                if_score_min = ?,
-                if_score_max = ?,
-                temp_zscore_max = ?,
-                payload_json = ?
-            WHERE incident_id = ?
-            """,
-            (
-                "OPEN",
-                severity,
-                severity_peak_new,
-                d.get("anomaly_reason", "unknown"),
-                nowi,
-                None,
-                int(occurrences) + 1,
-                int(d["reading_index"]),
-                min(float(if_score_min), if_score),
-                max(float(if_score_max), if_score),
-                max(float(temp_zscore_max), temp_zscore),
-                json.dumps(d, separators=(",", ":")),
-                incident_id,
-            ),
-        )
-
+            "OPEN",
+            severity,
+            severity_peak_new,
+            d.get("anomaly_reason", "unknown"),
+            nowi,
+            None,
+            int(occurrences) + 1,
+            int(d["reading_index"]),
+            min(float(if_score_min), if_score),
+            max(float(if_score_max), if_score),
+            max(float(temp_zscore_max), temp_zscore),
+            json.dumps(d, separators=(",", ":")),
+            incident_id,
+        ),
+    )
     con.commit()
-    return incident_id
+    return incident_id, action
 
 
 def resolve_incident(con, device_id: str):
     incident_id = incident_id_for(device_id)
-    con.execute(
+    cur = con.execute(
         """
         UPDATE incidents
         SET status = ?, resolved_at = ?, last_seen_at = ?
@@ -430,6 +436,7 @@ def resolve_incident(con, device_id: str):
         ("RESOLVED", now_iso(), now_iso(), incident_id),
     )
     con.commit()
+    return cur.rowcount
 
 
 # ============================================================
@@ -487,8 +494,17 @@ def on_message(client, userdata, msg):
         st["norm_run"] += 1
         st["anom_run"] = 0
 
-    # OPEN / UPSERT incident after N consecutive anomaly messages
-    if is_final == 1 and st["anom_run"] >= OPEN_N and not in_cooldown:
+    if DEBUG_LOG_EVERY_MESSAGE:
+        cooldown_str = cooldown_until.isoformat() if cooldown_until is not None else "None"
+        log(
+            f"[DEBUG] device={dev} idx={d['reading_index']} "
+            f"is_final={is_final} anom_run={st['anom_run']} norm_run={st['norm_run']} "
+            f"in_cooldown={in_cooldown} cooldown_until={cooldown_str} "
+            f"reason={d['anomaly_reason']} severity={severity}"
+        )
+
+    # OPEN / UPSERT incident only when threshold is first reached
+    if is_final == 1 and st["anom_run"] == OPEN_N and not in_cooldown:
         event_row = {
             "ts_event": now_iso(),
             "ts_inference": d["ts_inference"],
@@ -509,7 +525,7 @@ def on_message(client, userdata, msg):
 
         try:
             retry_db_write(insert_event, db_con, event_row)
-            incident_id = retry_db_write(upsert_incident, db_con, d, severity)
+            incident_id, incident_action = retry_db_write(upsert_incident, db_con, d, severity)
         except Exception as e:
             log(f"[ERROR] db write failed for device={dev} idx={d['reading_index']} error={e}")
             return
@@ -526,21 +542,34 @@ def on_message(client, userdata, msg):
             "if_score": float(d["if_score"]),
             "temp_zscore": float(d["temp_zscore"]),
             "is_anomaly_final": 1,
-            "event_action": "OPEN_OR_UPDATE",
+            "event_action": incident_action,
         }
 
         client.publish(OUTPUT_TOPIC, json.dumps(downstream), qos=0, retain=False)
 
         log(
-            f"[EVENT] open/update incident "
+            f"[EVENT] {incident_action.lower()} incident "
             f"device={dev} idx={d['reading_index']} "
             f"severity={severity} reason={d['anomaly_reason']}"
+        )
+
+    elif is_final == 1 and st["anom_run"] > OPEN_N and not in_cooldown:
+        # Optional trace for long anomaly streaks after incident is already opened
+        log(
+            f"[DEBUG] anomaly streak continuing "
+            f"device={dev} idx={d['reading_index']} anom_run={st['anom_run']}"
+        )
+
+    elif is_final == 1 and in_cooldown:
+        log(
+            f"[DEBUG] anomaly ignored due to cooldown "
+            f"device={dev} idx={d['reading_index']}"
         )
 
     # RESOLVE after M consecutive normal messages
     if is_final == 0 and st["norm_run"] >= RESOLVE_M:
         try:
-            retry_db_write(resolve_incident, db_con, dev)
+            updated = retry_db_write(resolve_incident, db_con, dev)
         except Exception as e:
             log(f"[ERROR] resolve failed for device={dev} error={e}")
             return
@@ -549,24 +578,26 @@ def on_message(client, userdata, msg):
         st["norm_run"] = 0
         st["anom_run"] = 0
 
-        downstream = {
-            "ts_event": now_iso(),
-            "incident_id": incident_id_for(dev),
-            "factory_id": d["factory_id"],
-            "machine_id": d["machine_id"],
-            "device_id": d["device_id"],
-            "reading_index": int(d["reading_index"]),
-            "severity": "info",
-            "anomaly_reason": "normal",
-            "if_score": float(d["if_score"]),
-            "temp_zscore": float(d["temp_zscore"]),
-            "is_anomaly_final": 0,
-            "event_action": "RESOLVE",
-        }
+        if updated > 0:
+            downstream = {
+                "ts_event": now_iso(),
+                "incident_id": incident_id_for(dev),
+                "factory_id": d["factory_id"],
+                "machine_id": d["machine_id"],
+                "device_id": d["device_id"],
+                "reading_index": int(d["reading_index"]),
+                "severity": "info",
+                "anomaly_reason": "normal",
+                "if_score": float(d["if_score"]),
+                "temp_zscore": float(d["temp_zscore"]),
+                "is_anomaly_final": 0,
+                "event_action": "RESOLVE",
+            }
 
-        client.publish(OUTPUT_TOPIC, json.dumps(downstream), qos=0, retain=False)
-
-        log(f"[EVENT] resolved incident device={dev}")
+            client.publish(OUTPUT_TOPIC, json.dumps(downstream), qos=0, retain=False)
+            log(f"[EVENT] resolved incident device={dev}")
+        else:
+            log(f"[DEBUG] resolve threshold reached but no OPEN incident existed for device={dev}")
 
 
 def on_disconnect(client, userdata, rc, properties=None):
