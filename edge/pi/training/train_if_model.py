@@ -46,8 +46,8 @@ MVA_HOME = Path(os.path.expanduser("~/mva"))
 DATA_DIR = MVA_HOME / "data"
 MODELS_DIR = MVA_HOME / "models"
 
-IDLE_CSV = DATA_DIR / "idle.csv"
-LOAD_CSV = DATA_DIR / "load.csv"
+IDLE_CSV = DATA_DIR / "idle_20260414.csv"
+LOAD_CSV = DATA_DIR / "load_20260414.csv"
 
 COMBINED_CSV = DATA_DIR / "healthy_combined_for_training.csv"
 MODEL_FILE = MODELS_DIR / "if_model.joblib"

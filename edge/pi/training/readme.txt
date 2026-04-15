@@ -7,3 +7,7 @@
 
 3. run with 
 ~/mva/.venv/bin/python ~/mva/train_if_model.py
+
+if missing any import then install them 
+
+~/mva/.venv/bin/pip install joblib numpy pandas scikit-learn
