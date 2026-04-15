@@ -47,6 +47,26 @@ const char* machineId = "machine-001";
 const char* deviceId = "esp32-001";
 
 // ======================================================
+// ANOMALY SIMULATION CONFIG
+// ======================================================
+// Set to true to inject simulated anomaly values for testing.
+bool FORCE_ANOMALY = true;
+
+// Start anomaly burst after this reading index.
+const uint32_t FORCE_ANOMALY_FROM = 100;
+
+// Number of consecutive anomalous readings to send.
+// event_processing needs 3 consecutive anomaly messages,
+// so 5 gives some safety margin.
+const uint32_t FORCE_ANOMALY_COUNT = 200;
+
+// Forced anomaly values
+const float FORCED_TEMP_C = 85.0f;
+const float FORCED_X_G = 4.5f;
+const float FORCED_Y_G = 4.2f;
+const float FORCED_Z_G = 5.1f;
+
+// ======================================================
 // DS18B20
 // ======================================================
 #define ONE_WIRE_BUS 4
@@ -74,8 +94,8 @@ PubSubClient mqttClient(espClient);
 // ======================================================
 // TIMING
 // ======================================================
-// Publish accelerometer data at 100 Hz
-const unsigned long publishIntervalMs = 10;
+// Publish accelerometer data at 50 Hz
+const unsigned long publishIntervalMs = 20;
 
 // Read temperature asynchronously every 1 second
 const unsigned long tempRequestIntervalMs = 1000;
@@ -94,6 +114,12 @@ float latestTempC = NAN;
 // ======================================================
 // HELPERS
 // ======================================================
+bool isForcedAnomalyReading(uint32_t idx) {
+  return FORCE_ANOMALY &&
+         idx >= FORCE_ANOMALY_FROM &&
+         idx < (FORCE_ANOMALY_FROM + FORCE_ANOMALY_COUNT);
+}
+
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -311,6 +337,13 @@ void setup() {
 
   Serial.println("System ready");
   Serial.println("------------------------------------");
+  Serial.print("FORCE_ANOMALY = ");
+  Serial.println(FORCE_ANOMALY ? "true" : "false");
+  Serial.print("FORCE_ANOMALY_FROM = ");
+  Serial.println(FORCE_ANOMALY_FROM);
+  Serial.print("FORCE_ANOMALY_COUNT = ");
+  Serial.println(FORCE_ANOMALY_COUNT);
+  Serial.println("------------------------------------");
 }
 
 // ======================================================
@@ -349,6 +382,15 @@ void loop() {
     // If temperature not yet available, publish sentinel
     float tempToSend = isnan(latestTempC) ? -127.0f : latestTempC;
 
+    // Inject anomaly for a short burst of consecutive readings
+    if (isForcedAnomalyReading(readingIndex)) {
+      tempToSend = FORCED_TEMP_C;
+      x_g = FORCED_X_G;
+      y_g = FORCED_Y_G;
+      z_g = FORCED_Z_G;
+      Serial.println(">>> FORCED ANOMALY ACTIVE <<<");
+    }
+
     char payload[320];
     snprintf(
       payload,
@@ -370,9 +412,14 @@ void loop() {
     bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      if (readingIndex % 50 == 0) {
+      if (readingIndex % 20 == 0 || isForcedAnomalyReading(readingIndex)) {
         Serial.print("Published reading ");
         Serial.print(readingIndex);
+
+        if (isForcedAnomalyReading(readingIndex)) {
+          Serial.print(" [ANOMALY]");
+        }
+
         Serial.print(" | TempC=");
         Serial.print(tempToSend, 2);
         Serial.print(" | Xg=");
@@ -382,6 +429,7 @@ void loop() {
         Serial.print(" | Zg=");
         Serial.println(z_g, 3);
       }
+
       readingIndex++;
     } else {
       Serial.println("MQTT publish FAILED");
