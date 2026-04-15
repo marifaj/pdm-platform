@@ -36,7 +36,7 @@ LOG_PATH = os.path.expanduser("~/mva/logs/event_processing.log")
 # Hysteresis / incident behavior
 OPEN_N = int(os.getenv("EVENT_OPEN_N", "3"))          # consecutive anomaly messages to open/update
 RESOLVE_M = int(os.getenv("EVENT_RESOLVE_M", "10"))   # consecutive normal messages to resolve
-COOLDOWN_S = int(os.getenv("EVENT_COOLDOWN_S", "60")) # after resolution, pause re-open for this many seconds
+COOLDOWN_S = int(os.getenv("EVENT_COOLDOWN_S", "60")) # after real resolution, pause re-open for this many seconds
 
 DEBUG_LOG_EVERY_MESSAGE = os.getenv("EVENT_DEBUG_EVERY_MESSAGE", "true").lower() == "true"
 
@@ -296,11 +296,8 @@ def upsert_incident(con, d: dict, severity: str):
 
     row = con.execute(
         """
-        SELECT incident_id, status, severity_current, severity_peak, occurrences,
-               opened_at, last_seen_at, resolved_at,
-               reading_index_first, reading_index_last,
-               if_score_min, if_score_max, temp_zscore_max,
-               anomaly_reason_first, anomaly_reason_last
+        SELECT incident_id, status, severity_peak, occurrences,
+               if_score_min, if_score_max, temp_zscore_max
         FROM incidents
         WHERE incident_id = ?
         """,
@@ -365,19 +362,11 @@ def upsert_incident(con, d: dict, severity: str):
     (
         _incident_id,
         status,
-        _severity_current,
         severity_peak,
         occurrences,
-        _opened_at,
-        _last_seen_at,
-        _resolved_at,
-        _reading_index_first,
-        _reading_index_last,
         if_score_min,
         if_score_max,
         temp_zscore_max,
-        _anomaly_reason_first,
-        _anomaly_reason_last,
     ) = row
 
     severity_peak_new = severity_peak
@@ -554,7 +543,6 @@ def on_message(client, userdata, msg):
         )
 
     elif is_final == 1 and st["anom_run"] > OPEN_N and not in_cooldown:
-        # Optional trace for long anomaly streaks after incident is already opened
         log(
             f"[DEBUG] anomaly streak continuing "
             f"device={dev} idx={d['reading_index']} anom_run={st['anom_run']}"
@@ -574,11 +562,11 @@ def on_message(client, userdata, msg):
             log(f"[ERROR] resolve failed for device={dev} error={e}")
             return
 
-        st["cooldown_until"] = datetime.now(timezone.utc) + timedelta(seconds=COOLDOWN_S)
-        st["norm_run"] = 0
-        st["anom_run"] = 0
-
         if updated > 0:
+            st["cooldown_until"] = datetime.now(timezone.utc) + timedelta(seconds=COOLDOWN_S)
+            st["norm_run"] = 0
+            st["anom_run"] = 0
+
             downstream = {
                 "ts_event": now_iso(),
                 "incident_id": incident_id_for(dev),
@@ -597,6 +585,10 @@ def on_message(client, userdata, msg):
             client.publish(OUTPUT_TOPIC, json.dumps(downstream), qos=0, retain=False)
             log(f"[EVENT] resolved incident device={dev}")
         else:
+            # No open incident existed, so do NOT enter cooldown.
+            # Just reset counters so the normal warm-up phase does not keep retriggering.
+            st["norm_run"] = 0
+            st["anom_run"] = 0
             log(f"[DEBUG] resolve threshold reached but no OPEN incident existed for device={dev}")
 
 
