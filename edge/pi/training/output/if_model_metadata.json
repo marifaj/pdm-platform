@@ -1,0 +1,25 @@
+{
+  "model_type": "IsolationForest",
+  "created_utc": "2026-04-15T07:28:20Z",
+  "feature_columns": [
+    "temperature_c",
+    "x_g",
+    "y_g",
+    "z_g",
+    "vibration_mag_g"
+  ],
+  "idle_csv": "/home/marifaj/mva/data/idle_20260414.csv",
+  "load_csv": "/home/marifaj/mva/data/load_20260414.csv",
+  "combined_rows": 91960,
+  "idle_rows": 63845,
+  "load_rows": 28115,
+  "training_conditions": [
+    "idle",
+    "load"
+  ],
+  "random_state": 42,
+  "n_estimators": 200,
+  "contamination": 0.01,
+  "max_samples": "auto",
+  "notes": "First row-level healthy-behavior model. Trained only on normal idle and normal load data. Later version should use window-based features."
+}

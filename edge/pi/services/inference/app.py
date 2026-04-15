@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 import json
-import math
 import os
 import signal
+import sqlite3
 import sys
 import time
 from collections import deque
@@ -34,7 +34,11 @@ INPUT_TOPIC = os.getenv("INFERENCE_INPUT_TOPIC", "mva/normalized/telemetry")
 OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
 MODEL_PATH = os.path.expanduser(os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/if_model.joblib"))
+DB_PATH = os.path.expanduser(os.getenv("INFERENCE_DB_PATH", "~/mva/data/mva.db"))
 LOG_PATH = os.path.expanduser("~/mva/logs/inference.log")
+
+# Store every Nth inference result to SQLite
+INFERENCE_SAVE_EVERY_N = int(os.getenv("INFERENCE_SAVE_EVERY_N", "10"))
 
 FEATURE_COLUMNS = [
     "temperature_c",
@@ -45,19 +49,14 @@ FEATURE_COLUMNS = [
 ]
 
 # ---- EWMA parameters ----
-# Lower alpha = smoother EWMA; 0.05 to 0.2 is a reasonable starting range
 EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.10"))
-
-# How many recent residuals to keep for z-score calculation
 EWMA_WINDOW_SIZE = int(os.getenv("EWMA_WINDOW_SIZE", "200"))
-
-# Z-score threshold for temperature anomaly
 EWMA_Z_THRESHOLD = float(os.getenv("EWMA_Z_THRESHOLD", "3.0"))
-
-# Minimum residual std to avoid division by zero / unstable tiny std
 EWMA_MIN_STD = float(os.getenv("EWMA_MIN_STD", "0.05"))
 
-# If true, final anomaly if either ML or EWMA says anomaly
+# Hybrid decision mode:
+# true  -> final anomaly if either ML or EWMA says anomaly
+# false -> final anomaly only if both say anomaly
 HYBRID_USE_OR = os.getenv("HYBRID_USE_OR", "true").lower() == "true"
 
 
@@ -65,10 +64,15 @@ HYBRID_USE_OR = os.getenv("HYBRID_USE_OR", "true").lower() == "true"
 # LOGGING
 # ============================================================
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def now_iso_ms() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def log(msg: str) -> None:
@@ -82,14 +86,157 @@ def log(msg: str) -> None:
 
 
 # ============================================================
+# SQLITE
+# ============================================================
+def connect_db():
+    con = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False,
+    )
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA busy_timeout=30000;")
+    return con
+
+
+def ensure_inference_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inference_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_inference TEXT NOT NULL,
+          ts_gateway TEXT NOT NULL,
+          factory_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          reading_index INTEGER NOT NULL,
+
+          temperature_c REAL,
+          x_g REAL,
+          y_g REAL,
+          z_g REAL,
+          vibration_mag_g REAL,
+
+          if_score REAL,
+          if_pred INTEGER,
+          is_anomaly_ml INTEGER,
+
+          temp_ewma REAL,
+          temp_residual REAL,
+          temp_zscore REAL,
+          is_anomaly_ewma INTEGER,
+
+          is_anomaly_final INTEGER,
+          anomaly_reason TEXT,
+
+          payload_json TEXT
+        )
+        """
+    )
+
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_inference_results_device_ts
+        ON inference_results(device_id, ts_inference)
+        """
+    )
+
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_inference_results_reading
+        ON inference_results(reading_index)
+        """
+    )
+
+    con.commit()
+
+
+def insert_inference_result(con, result: dict):
+    values = (
+        result["ts_inference"],
+        result["ts_gateway"],
+        result["factory_id"],
+        result["machine_id"],
+        result["device_id"],
+        int(result["reading_index"]),
+
+        float(result["temperature_c"]),
+        float(result["x_g"]),
+        float(result["y_g"]),
+        float(result["z_g"]),
+        float(result["vibration_mag_g"]),
+
+        float(result["if_score"]),
+        int(result["if_pred"]),
+        int(result["is_anomaly_ml"]),
+
+        float(result["temp_ewma"]),
+        float(result["temp_residual"]),
+        float(result["temp_zscore"]),
+        int(result["is_anomaly_ewma"]),
+
+        int(result["is_anomaly_final"]),
+        result["anomaly_reason"],
+
+        json.dumps(result, separators=(",", ":")),
+    )
+
+    for attempt in range(5):
+        try:
+            con.execute(
+                """
+                INSERT INTO inference_results(
+                  ts_inference,
+                  ts_gateway,
+                  factory_id,
+                  machine_id,
+                  device_id,
+                  reading_index,
+                  temperature_c,
+                  x_g,
+                  y_g,
+                  z_g,
+                  vibration_mag_g,
+                  if_score,
+                  if_pred,
+                  is_anomaly_ml,
+                  temp_ewma,
+                  temp_residual,
+                  temp_zscore,
+                  is_anomaly_ewma,
+                  is_anomaly_final,
+                  anomaly_reason,
+                  payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            con.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                time.sleep(0.05 * (attempt + 1))
+            else:
+                raise
+
+    raise sqlite3.OperationalError("inference_results remained locked after retries")
+
+
+db_con = connect_db()
+ensure_inference_table(db_con)
+log(f"[BOOT] inference_results table ensured at {DB_PATH}")
+
+
+# ============================================================
 # MODEL LOADING
 # ============================================================
 def load_model():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
-    model = joblib.load(MODEL_PATH)
+    m = joblib.load(MODEL_PATH)
     log(f"[BOOT] model loaded from {MODEL_PATH}")
-    return model
+    return m
 
 
 try:
@@ -113,21 +260,15 @@ class EWMATemperatureMonitor:
         self.residuals = deque(maxlen=window_size)
 
     def update(self, temp_c: float):
-        """
-        Returns:
-            temp_ewma, residual, zscore, is_anomaly_ewma
-        """
         if self.ewma is None:
             self.ewma = temp_c
             residual = 0.0
             self.residuals.append(residual)
             return self.ewma, residual, 0.0, 0
 
-        # Update EWMA
         self.ewma = self.alpha * temp_c + (1.0 - self.alpha) * self.ewma
         residual = temp_c - self.ewma
 
-        # Compute z-score based on residual history
         if len(self.residuals) >= 10:
             mean_res = float(np.mean(self.residuals))
             std_res = float(np.std(self.residuals))
@@ -194,13 +335,8 @@ def extract_features(d: dict):
 # INFERENCE LOGIC
 # ============================================================
 def run_ml_inference(X: np.ndarray):
-    """
-    Isolation Forest:
-    - decision_function: higher = more normal, lower = more anomalous
-    - predict: 1 = normal, -1 = anomaly
-    """
-    score = float(model.decision_function(X)[0])
-    pred = int(model.predict(X)[0])
+    score = float(model.decision_function(X)[0])  # higher = more normal
+    pred = int(model.predict(X)[0])               # 1 = normal, -1 = anomaly
     is_anomaly_ml = 1 if pred == -1 else 0
     return score, pred, is_anomaly_ml
 
@@ -250,51 +386,58 @@ def on_message(client, userdata, msg):
         return
 
     try:
-        # ---- ML ----
+        # ML inference
         if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
 
-        # ---- EWMA on temperature ----
+        # EWMA on temperature
         temp_c = float(d["temperature_c"])
         temp_ewma, temp_residual, temp_zscore, is_anomaly_ewma = temp_monitor.update(temp_c)
 
-        # ---- Hybrid final decision ----
+        # Final hybrid decision
         is_anomaly_final, anomaly_reason = combine_decision(
             is_anomaly_ml=is_anomaly_ml,
             is_anomaly_ewma=is_anomaly_ewma,
         )
 
         result = {
-            "ts_inference": now_iso(),
+            "ts_inference": now_iso_ms(),
             "factory_id": d["factory_id"],
             "machine_id": d["machine_id"],
             "device_id": d["device_id"],
             "reading_index": int(d["reading_index"]),
             "ts_gateway": d["ts_gateway"],
 
-            # raw normalized telemetry
             "temperature_c": temp_c,
             "x_g": float(d["x_g"]),
             "y_g": float(d["y_g"]),
             "z_g": float(d["z_g"]),
             "vibration_mag_g": float(d["vibration_mag_g"]),
 
-            # ML output
             "if_score": if_score,
             "if_pred": if_pred,
             "is_anomaly_ml": is_anomaly_ml,
 
-            # EWMA output
             "temp_ewma": round(float(temp_ewma), 6),
             "temp_residual": round(float(temp_residual), 6),
             "temp_zscore": round(float(temp_zscore), 6),
             "is_anomaly_ewma": is_anomaly_ewma,
 
-            # final decision
             "is_anomaly_final": is_anomaly_final,
             "anomaly_reason": anomaly_reason,
         }
 
+        # Publish every inference result to MQTT
         client.publish(OUTPUT_TOPIC, json.dumps(result), qos=0, retain=False)
+
+        # Store only every Nth result to SQLite
+        if int(result["reading_index"]) % INFERENCE_SAVE_EVERY_N == 0:
+            try:
+                insert_inference_result(db_con, result)
+            except Exception as e:
+                log(
+                    f"[ERROR] failed to store inference result "
+                    f"idx={result['reading_index']} error={e}"
+                )
 
         if int(d["reading_index"]) % 100 == 0:
             log(
@@ -330,6 +473,10 @@ def main():
         client.loop_stop()
         try:
             client.disconnect()
+        except Exception:
+            pass
+        try:
+            db_con.close()
         except Exception:
             pass
         sys.exit(0)
