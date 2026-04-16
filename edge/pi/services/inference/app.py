@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,14 +34,14 @@ INPUT_TOPIC = os.getenv("INFERENCE_INPUT_TOPIC", "mva/normalized/telemetry")
 OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
 MODEL_PATH = os.path.expanduser(
-    os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/if_model.joblib")
+    os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/if_window_model.joblib")
 )
 
-# Optional lightweight debug
+# Turn on only when debugging
 ENABLE_CONSOLE_LOGGING = False
 
 # ============================================================
-# EXPERIMENT SETTINGS
+# DETECTION SETTINGS
 # ============================================================
 # Allowed:
 #   "ewma_only"
@@ -49,27 +49,56 @@ ENABLE_CONSOLE_LOGGING = False
 #   "hybrid"
 DETECTION_MODE = "hybrid"
 
-ML_RUN_EVERY_N = 1
-DISABLE_ML_WHEN_UNUSED = True
-
-FEATURE_COLUMNS = [
-    "temperature_c",
-    "x_g",
-    "y_g",
-    "z_g",
-    "vibration_mag_g",
-]
-
-# ---- EWMA parameters ----
-EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.10"))
-EWMA_WINDOW_SIZE = int(os.getenv("EWMA_WINDOW_SIZE", "200"))
-EWMA_Z_THRESHOLD = float(os.getenv("EWMA_Z_THRESHOLD", "3.0"))
-EWMA_MIN_STD = float(os.getenv("EWMA_MIN_STD", "0.05"))
-
 # For hybrid mode:
 # True  -> anomaly if either ML or EWMA says anomaly
 # False -> anomaly only if both say anomaly
 HYBRID_USE_OR = True
+
+# If True and DETECTION_MODE == "ewma_only", model is not loaded at all.
+DISABLE_ML_WHEN_UNUSED = True
+
+# ============================================================
+# WINDOW SETTINGS
+# ============================================================
+# At 50 Hz:
+#   WINDOW_SIZE = 50  -> 1.0 second
+#   WINDOW_STEP = 25  -> new ML result every 0.5 seconds
+WINDOW_SIZE = int(os.getenv("INFERENCE_WINDOW_SIZE", "50"))
+WINDOW_STEP = int(os.getenv("INFERENCE_WINDOW_STEP", "25"))
+
+# Keep enough recent samples per device
+MAX_BUFFER_SIZE = max(WINDOW_SIZE * 3, WINDOW_SIZE + WINDOW_STEP + 10)
+
+# ============================================================
+# WINDOW FEATURE COLUMNS
+# IMPORTANT:
+# The trained ML model must be trained using these exact columns.
+# ============================================================
+FEATURE_COLUMNS = [
+    "temp_mean",
+    "temp_std",
+    "temp_min",
+    "temp_max",
+    "x_mean",
+    "x_std",
+    "y_mean",
+    "y_std",
+    "z_mean",
+    "z_std",
+    "vib_mean",
+    "vib_std",
+    "vib_min",
+    "vib_max",
+    "vib_rms",
+]
+
+# ============================================================
+# EWMA PARAMETERS
+# ============================================================
+EWMA_ALPHA = float(os.getenv("EWMA_ALPHA", "0.10"))
+EWMA_WINDOW_SIZE = int(os.getenv("EWMA_WINDOW_SIZE", "200"))
+EWMA_Z_THRESHOLD = float(os.getenv("EWMA_Z_THRESHOLD", "3.0"))
+EWMA_MIN_STD = float(os.getenv("EWMA_MIN_STD", "0.05"))
 
 
 # ============================================================
@@ -99,9 +128,9 @@ def should_load_model() -> bool:
 
 def load_model():
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        raise FileNotFoundError(f"Window model file not found: {MODEL_PATH}")
     m = joblib.load(MODEL_PATH)
-    log(f"[BOOT] model loaded from {MODEL_PATH}")
+    log(f"[BOOT] window model loaded from {MODEL_PATH}")
     return m
 
 
@@ -113,7 +142,7 @@ else:
 
 
 # ============================================================
-# EWMA STATE
+# EWMA STATE (PER DEVICE)
 # ============================================================
 class EWMATemperatureMonitor:
     def __init__(self, alpha: float, window_size: int, z_threshold: float, min_std: float):
@@ -149,16 +178,28 @@ class EWMATemperatureMonitor:
         return self.ewma, residual, zscore, is_anomaly
 
 
-temp_monitor = EWMATemperatureMonitor(
-    alpha=EWMA_ALPHA,
-    window_size=EWMA_WINDOW_SIZE,
-    z_threshold=EWMA_Z_THRESHOLD,
-    min_std=EWMA_MIN_STD,
-)
+temp_monitors_by_device = {}
+
+
+def get_temp_monitor(device_id: str) -> EWMATemperatureMonitor:
+    if device_id not in temp_monitors_by_device:
+        temp_monitors_by_device[device_id] = EWMATemperatureMonitor(
+            alpha=EWMA_ALPHA,
+            window_size=EWMA_WINDOW_SIZE,
+            z_threshold=EWMA_Z_THRESHOLD,
+            min_std=EWMA_MIN_STD,
+        )
+    return temp_monitors_by_device[device_id]
 
 
 # ============================================================
-# FEATURE EXTRACTION
+# WINDOW BUFFERS (PER DEVICE)
+# ============================================================
+buffers_by_device = defaultdict(lambda: deque(maxlen=MAX_BUFFER_SIZE))
+
+
+# ============================================================
+# PAYLOAD VALIDATION
 # ============================================================
 def validate_payload(d: dict):
     required = [
@@ -179,8 +220,13 @@ def validate_payload(d: dict):
     return True, "ok"
 
 
-def extract_feature_row(d: dict):
+def normalize_input_row(d: dict):
     return {
+        "factory_id": d["factory_id"],
+        "machine_id": d["machine_id"],
+        "device_id": d["device_id"],
+        "reading_index": int(d["reading_index"]),
+        "ts_gateway": d["ts_gateway"],
         "temperature_c": float(d["temperature_c"]),
         "x_g": float(d["x_g"]),
         "y_g": float(d["y_g"]),
@@ -189,12 +235,42 @@ def extract_feature_row(d: dict):
     }
 
 
-def make_feature_frame(row: dict) -> pd.DataFrame:
-    return pd.DataFrame([row], columns=FEATURE_COLUMNS)
+# ============================================================
+# WINDOW FEATURE ENGINEERING
+# ============================================================
+def compute_window_features(window_rows):
+    temps = np.array([r["temperature_c"] for r in window_rows], dtype=float)
+    x_vals = np.array([r["x_g"] for r in window_rows], dtype=float)
+    y_vals = np.array([r["y_g"] for r in window_rows], dtype=float)
+    z_vals = np.array([r["z_g"] for r in window_rows], dtype=float)
+    vib_vals = np.array([r["vibration_mag_g"] for r in window_rows], dtype=float)
+
+    features = {
+        "temp_mean": float(np.mean(temps)),
+        "temp_std": float(np.std(temps)),
+        "temp_min": float(np.min(temps)),
+        "temp_max": float(np.max(temps)),
+        "x_mean": float(np.mean(x_vals)),
+        "x_std": float(np.std(x_vals)),
+        "y_mean": float(np.mean(y_vals)),
+        "y_std": float(np.std(y_vals)),
+        "z_mean": float(np.mean(z_vals)),
+        "z_std": float(np.std(z_vals)),
+        "vib_mean": float(np.mean(vib_vals)),
+        "vib_std": float(np.std(vib_vals)),
+        "vib_min": float(np.min(vib_vals)),
+        "vib_max": float(np.max(vib_vals)),
+        "vib_rms": float(np.sqrt(np.mean(np.square(vib_vals)))),
+    }
+    return features
+
+
+def make_feature_frame(feature_row: dict) -> pd.DataFrame:
+    return pd.DataFrame([feature_row], columns=FEATURE_COLUMNS)
 
 
 # ============================================================
-# INFERENCE LOGIC
+# ML INFERENCE
 # ============================================================
 def run_ml_inference(X: pd.DataFrame):
     score = float(model.decision_function(X)[0])  # higher = more normal
@@ -226,23 +302,122 @@ def combine_decision(is_anomaly_ml: int, is_anomaly_ewma: int):
     return is_final, reason
 
 
-last_ml_state_by_device = {}
+# ============================================================
+# WINDOW / EWMA DECISION LOGIC
+# ============================================================
+def get_window_ewma_flag(window_rows):
+    # Use latest per-message EWMA decision inside the window
+    # You could also use any(window anomaly) if you want more sensitivity.
+    latest = window_rows[-1]
+    return int(latest.get("is_anomaly_ewma", 0))
 
 
-def get_last_ml_state(device_id: str):
-    return last_ml_state_by_device.get(device_id, {
-        "if_score": 0.0,
-        "if_pred": 1,
-        "is_anomaly_ml": 0,
-    })
+def build_window_result(window_rows, window_features, if_score, if_pred, is_anomaly_ml):
+    first_row = window_rows[0]
+    last_row = window_rows[-1]
 
+    is_anomaly_ewma = get_window_ewma_flag(window_rows)
+    is_anomaly_final, anomaly_reason = combine_decision(
+        is_anomaly_ml=is_anomaly_ml,
+        is_anomaly_ewma=is_anomaly_ewma,
+    )
 
-def set_last_ml_state(device_id: str, if_score: float, if_pred: int, is_anomaly_ml: int):
-    last_ml_state_by_device[device_id] = {
-        "if_score": if_score,
-        "if_pred": if_pred,
-        "is_anomaly_ml": is_anomaly_ml,
+    result = {
+        "ts_inference": now_iso_ms(),
+        "factory_id": last_row["factory_id"],
+        "machine_id": last_row["machine_id"],
+        "device_id": last_row["device_id"],
+
+        "window_start_index": int(first_row["reading_index"]),
+        "window_end_index": int(last_row["reading_index"]),
+        "window_size": int(len(window_rows)),
+        "window_step": int(WINDOW_STEP),
+
+        "window_start_ts": first_row["ts_gateway"],
+        "window_end_ts": last_row["ts_gateway"],
+
+        "temp_mean": round(float(window_features["temp_mean"]), 6),
+        "temp_std": round(float(window_features["temp_std"]), 6),
+        "temp_min": round(float(window_features["temp_min"]), 6),
+        "temp_max": round(float(window_features["temp_max"]), 6),
+
+        "x_mean": round(float(window_features["x_mean"]), 6),
+        "x_std": round(float(window_features["x_std"]), 6),
+        "y_mean": round(float(window_features["y_mean"]), 6),
+        "y_std": round(float(window_features["y_std"]), 6),
+        "z_mean": round(float(window_features["z_mean"]), 6),
+        "z_std": round(float(window_features["z_std"]), 6),
+
+        "vib_mean": round(float(window_features["vib_mean"]), 6),
+        "vib_std": round(float(window_features["vib_std"]), 6),
+        "vib_min": round(float(window_features["vib_min"]), 6),
+        "vib_max": round(float(window_features["vib_max"]), 6),
+        "vib_rms": round(float(window_features["vib_rms"]), 6),
+
+        "if_score": float(if_score),
+        "if_pred": int(if_pred),
+        "is_anomaly_ml": int(is_anomaly_ml),
+
+        # include latest EWMA state from latest message in the window
+        "temp_ewma": round(float(last_row.get("temp_ewma", 0.0)), 6),
+        "temp_residual": round(float(last_row.get("temp_residual", 0.0)), 6),
+        "temp_zscore": round(float(last_row.get("temp_zscore", 0.0)), 6),
+        "is_anomaly_ewma": int(is_anomaly_ewma),
+
+        "is_anomaly_final": int(is_anomaly_final),
+        "anomaly_reason": anomaly_reason,
     }
+    return result
+
+
+def process_window_if_ready(client, device_id: str):
+    buf = buffers_by_device[device_id]
+
+    while len(buf) >= WINDOW_SIZE:
+        window_rows = list(buf)[:WINDOW_SIZE]
+
+        # EWMA-only mode
+        if DETECTION_MODE == "ewma_only":
+            if_score = 0.0
+            if_pred = 1
+            is_anomaly_ml = 0
+            window_features = compute_window_features(window_rows)
+            result = build_window_result(
+                window_rows=window_rows,
+                window_features=window_features,
+                if_score=if_score,
+                if_pred=if_pred,
+                is_anomaly_ml=is_anomaly_ml,
+            )
+
+        else:
+            window_features = compute_window_features(window_rows)
+            X = make_feature_frame(window_features)
+            if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
+
+            result = build_window_result(
+                window_rows=window_rows,
+                window_features=window_features,
+                if_score=if_score,
+                if_pred=if_pred,
+                is_anomaly_ml=is_anomaly_ml,
+            )
+
+        client.publish(OUTPUT_TOPIC, json.dumps(result), qos=0, retain=False)
+
+        log(
+            f"[WIN] device={device_id} "
+            f"idx={result['window_start_index']}-{result['window_end_index']} "
+            f"ml={result['is_anomaly_ml']} "
+            f"ewma={result['is_anomaly_ewma']} "
+            f"final={result['is_anomaly_final']} "
+            f"reason={result['anomaly_reason']}"
+        )
+
+        # Slide forward by WINDOW_STEP
+        drop_n = min(WINDOW_STEP, len(buf))
+        for _ in range(drop_n):
+            buf.popleft()
 
 
 # ============================================================
@@ -252,6 +427,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
     log(f"[MQTT] connected rc={rc}")
     client.subscribe(INPUT_TOPIC, qos=1)
     log(f"[MQTT] subscribed to {INPUT_TOPIC}")
+    log(
+        f"[BOOT] DETECTION_MODE={DETECTION_MODE} "
+        f"WINDOW_SIZE={WINDOW_SIZE} "
+        f"WINDOW_STEP={WINDOW_STEP}"
+    )
 
 
 def on_message(client, userdata, msg):
@@ -264,68 +444,23 @@ def on_message(client, userdata, msg):
             log(f"[WARN] invalid normalized payload: {why}")
             return
 
-        row = extract_feature_row(d)
+        row = normalize_input_row(d)
+        device_id = row["device_id"]
 
-        device_id = d["device_id"]
-        reading_index = int(d["reading_index"])
-
-        # EWMA every message
-        temp_c = row["temperature_c"]
-        temp_ewma, temp_residual, temp_zscore, is_anomaly_ewma = temp_monitor.update(temp_c)
-
-        # ML only if needed
-        ml_needed_for_mode = not (DETECTION_MODE == "ewma_only" and DISABLE_ML_WHEN_UNUSED)
-
-        if_score = 0.0
-        if_pred = 1
-        is_anomaly_ml = 0
-
-        if ml_needed_for_mode:
-            run_ml_now = (ML_RUN_EVERY_N <= 1) or (reading_index % ML_RUN_EVERY_N == 0)
-
-            if run_ml_now:
-                X = make_feature_frame(row)
-                if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
-                set_last_ml_state(device_id, if_score, if_pred, is_anomaly_ml)
-            else:
-                ml_state = get_last_ml_state(device_id)
-                if_score = float(ml_state["if_score"])
-                if_pred = int(ml_state["if_pred"])
-                is_anomaly_ml = int(ml_state["is_anomaly_ml"])
-
-        is_anomaly_final, anomaly_reason = combine_decision(
-            is_anomaly_ml=is_anomaly_ml,
-            is_anomaly_ewma=is_anomaly_ewma,
+        # EWMA still runs per message
+        temp_monitor = get_temp_monitor(device_id)
+        temp_ewma, temp_residual, temp_zscore, is_anomaly_ewma = temp_monitor.update(
+            row["temperature_c"]
         )
 
-        result = {
-            "ts_inference": now_iso_ms(),
-            "factory_id": d["factory_id"],
-            "machine_id": d["machine_id"],
-            "device_id": device_id,
-            "reading_index": reading_index,
-            "ts_gateway": d["ts_gateway"],
+        row["temp_ewma"] = float(temp_ewma)
+        row["temp_residual"] = float(temp_residual)
+        row["temp_zscore"] = float(temp_zscore)
+        row["is_anomaly_ewma"] = int(is_anomaly_ewma)
 
-            "temperature_c": row["temperature_c"],
-            "x_g": row["x_g"],
-            "y_g": row["y_g"],
-            "z_g": row["z_g"],
-            "vibration_mag_g": row["vibration_mag_g"],
+        buffers_by_device[device_id].append(row)
 
-            "if_score": if_score,
-            "if_pred": if_pred,
-            "is_anomaly_ml": is_anomaly_ml,
-
-            "temp_ewma": round(float(temp_ewma), 6),
-            "temp_residual": round(float(temp_residual), 6),
-            "temp_zscore": round(float(temp_zscore), 6),
-            "is_anomaly_ewma": is_anomaly_ewma,
-
-            "is_anomaly_final": is_anomaly_final,
-            "anomaly_reason": anomaly_reason,
-        }
-
-        client.publish(OUTPUT_TOPIC, json.dumps(result), qos=0, retain=False)
+        process_window_if_ready(client, device_id)
 
     except Exception as e:
         log(f"[ERROR] inference failed: {e}")
@@ -336,7 +471,7 @@ def on_message(client, userdata, msg):
 # ============================================================
 def main():
     client = mqtt.Client(
-        client_id="inference-service",
+        client_id="inference-service-windowed",
         protocol=mqtt.MQTTv311,
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )
@@ -358,7 +493,7 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    log("[BOOT] Inference-only service up")
+    log("[BOOT] Windowed inference service up")
     while True:
         time.sleep(1)
 
