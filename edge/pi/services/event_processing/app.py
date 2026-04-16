@@ -31,11 +31,11 @@ INPUT_TOPIC = os.getenv("EVENT_PROC_INPUT_TOPIC", "mva/inference/telemetry")
 OUTPUT_TOPIC = os.getenv("EVENT_PROC_OUTPUT_TOPIC", "mva/event/telemetry")
 
 DB_PATH = os.path.expanduser(os.getenv("EVENT_PROC_DB_PATH", "~/mva/data/mva.db"))
-LOG_PATH = os.path.expanduser("~/mva/logs/event_processing.log")
+LOG_PATH = os.path.expanduser(os.getenv("EVENT_PROC_LOG_PATH", "~/mva/logs/event_processing.log"))
 
 # Hysteresis / incident behavior
-OPEN_N = int(os.getenv("EVENT_OPEN_N", "3"))          # consecutive anomaly messages to open/update
-RESOLVE_M = int(os.getenv("EVENT_RESOLVE_M", "10"))   # consecutive normal messages to resolve
+OPEN_N = int(os.getenv("EVENT_OPEN_N", "3"))          # consecutive anomaly windows to open/update
+RESOLVE_M = int(os.getenv("EVENT_RESOLVE_M", "10"))   # consecutive normal windows to resolve
 COOLDOWN_S = int(os.getenv("EVENT_COOLDOWN_S", "60")) # after real resolution, pause re-open for this many seconds
 
 DEBUG_LOG_EVERY_MESSAGE = os.getenv("EVENT_DEBUG_EVERY_MESSAGE", "true").lower() == "true"
@@ -77,6 +77,7 @@ def connect_db():
 
 
 def ensure_tables(con):
+    # Keep old schema for compatibility, but add window columns
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -103,6 +104,19 @@ def ensure_tables(con):
         )
         """
     )
+
+    # Backward-compatible schema evolution
+    con.execute("ALTER TABLE events ADD COLUMN window_start_ts TEXT")
+    con.execute("ALTER TABLE events ADD COLUMN window_end_ts TEXT")
+    con.execute("ALTER TABLE events ADD COLUMN window_start_index INTEGER")
+    con.execute("ALTER TABLE events ADD COLUMN window_end_index INTEGER")
+    con.execute("ALTER TABLE events ADD COLUMN window_size INTEGER")
+    con.execute("ALTER TABLE events ADD COLUMN window_step INTEGER")
+    con.execute("ALTER TABLE events ADD COLUMN temp_mean REAL")
+    con.execute("ALTER TABLE events ADD COLUMN temp_std REAL")
+    con.execute("ALTER TABLE events ADD COLUMN vib_mean REAL")
+    con.execute("ALTER TABLE events ADD COLUMN vib_std REAL")
+    con.execute("ALTER TABLE events ADD COLUMN vib_rms REAL")
 
     con.execute(
         """
@@ -151,6 +165,132 @@ def ensure_tables(con):
         """
     )
 
+    # Backward-compatible schema evolution
+    con.execute("ALTER TABLE incidents ADD COLUMN window_start_index_first INTEGER")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_end_index_first INTEGER")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_start_index_last INTEGER")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_end_index_last INTEGER")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_start_ts_first TEXT")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_end_ts_first TEXT")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_start_ts_last TEXT")
+    con.execute("ALTER TABLE incidents ADD COLUMN window_end_ts_last TEXT")
+
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_incidents_device_status
+        ON incidents(device_id, status)
+        """
+    )
+
+    con.commit()
+
+
+def safe_alter(con, sql: str):
+    try:
+        con.execute(sql)
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "duplicate column name" in msg:
+            return
+        raise
+
+
+def ensure_tables_safe(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_event TEXT NOT NULL,
+          ts_inference TEXT NOT NULL,
+          ts_gateway TEXT NOT NULL,
+          factory_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          reading_index INTEGER NOT NULL,
+
+          severity TEXT NOT NULL,
+          anomaly_reason TEXT NOT NULL,
+
+          if_score REAL,
+          if_pred INTEGER,
+          is_anomaly_ml INTEGER,
+          temp_zscore REAL,
+          is_anomaly_ewma INTEGER,
+          is_anomaly_final INTEGER,
+
+          payload_json TEXT
+        )
+        """
+    )
+
+    safe_alter(con, "ALTER TABLE events ADD COLUMN window_start_ts TEXT")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN window_end_ts TEXT")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN window_start_index INTEGER")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN window_end_index INTEGER")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN window_size INTEGER")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN window_step INTEGER")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN temp_mean REAL")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN temp_std REAL")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN vib_mean REAL")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN vib_std REAL")
+    safe_alter(con, "ALTER TABLE events ADD COLUMN vib_rms REAL")
+
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_device_ts
+        ON events(device_id, ts_event)
+        """
+    )
+
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_reading
+        ON events(reading_index)
+        """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS incidents (
+          incident_id TEXT PRIMARY KEY,
+          factory_id TEXT NOT NULL,
+          machine_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+
+          status TEXT NOT NULL,
+          severity_current TEXT NOT NULL,
+          severity_peak TEXT NOT NULL,
+
+          anomaly_reason_first TEXT,
+          anomaly_reason_last TEXT,
+
+          opened_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          resolved_at TEXT,
+
+          occurrences INTEGER NOT NULL DEFAULT 1,
+
+          reading_index_first INTEGER,
+          reading_index_last INTEGER,
+
+          if_score_min REAL,
+          if_score_max REAL,
+          temp_zscore_max REAL,
+
+          payload_json TEXT
+        )
+        """
+    )
+
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_start_index_first INTEGER")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_end_index_first INTEGER")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_start_index_last INTEGER")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_end_index_last INTEGER")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_start_ts_first TEXT")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_end_ts_first TEXT")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_start_ts_last TEXT")
+    safe_alter(con, "ALTER TABLE incidents ADD COLUMN window_end_ts_last TEXT")
+
     con.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_incidents_device_status
@@ -174,20 +314,18 @@ def retry_db_write(fn, *args, **kwargs):
 
 
 db_con = connect_db()
-ensure_tables(db_con)
+ensure_tables_safe(db_con)
 log(f"[BOOT] events/incidents tables ensured at {DB_PATH}")
 
 
 # ============================================================
 # RUNTIME STATE
 # ============================================================
-# Per-device hysteresis counters
 state = {}
-# structure:
 # state[device_id] = {
 #   "anom_run": int,
 #   "norm_run": int,
-#   "cooldown_until": datetime | None
+#   "cooldown_until": datetime | None,
 # }
 
 
@@ -210,9 +348,6 @@ def severity_rank(sev: str) -> int:
 
 
 def severity_from_result(d: dict) -> str:
-    """
-    Simple severity mapping for the hybrid output.
-    """
     reason = d.get("anomaly_reason", "normal")
     is_final = int(d.get("is_anomaly_final", 0))
     temp_zscore = abs(float(d.get("temp_zscore", 0.0)))
@@ -233,7 +368,6 @@ def severity_from_result(d: dict) -> str:
             return "high"
         return "medium"
 
-    # Fallback
     if is_ml and is_ewma:
         return "critical"
     if is_ml:
@@ -245,6 +379,27 @@ def severity_from_result(d: dict) -> str:
 
 def incident_id_for(device_id: str) -> str:
     return f"INC-{device_id}"
+
+
+def normalize_window_payload(d: dict) -> dict:
+    """
+    Convert windowed inference payload into a backward-compatible shape
+    while preserving full window metadata.
+    """
+    out = dict(d)
+
+    # Legacy compatibility bridge
+    out["ts_gateway"] = d["window_end_ts"]
+    out["reading_index"] = int(d["window_end_index"])
+
+    # Defaults for optional aggregate fields
+    out.setdefault("temp_mean", 0.0)
+    out.setdefault("temp_std", 0.0)
+    out.setdefault("vib_mean", 0.0)
+    out.setdefault("vib_std", 0.0)
+    out.setdefault("vib_rms", 0.0)
+
+    return out
 
 
 def insert_event(con, event_row: dict):
@@ -266,8 +421,19 @@ def insert_event(con, event_row: dict):
           temp_zscore,
           is_anomaly_ewma,
           is_anomaly_final,
-          payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          payload_json,
+          window_start_ts,
+          window_end_ts,
+          window_start_index,
+          window_end_index,
+          window_size,
+          window_step,
+          temp_mean,
+          temp_std,
+          vib_mean,
+          vib_std,
+          vib_rms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             event_row["ts_event"],
@@ -286,6 +452,17 @@ def insert_event(con, event_row: dict):
             int(event_row["is_anomaly_ewma"]),
             int(event_row["is_anomaly_final"]),
             json.dumps(event_row, separators=(",", ":")),
+            event_row["window_start_ts"],
+            event_row["window_end_ts"],
+            int(event_row["window_start_index"]),
+            int(event_row["window_end_index"]),
+            int(event_row["window_size"]),
+            int(event_row["window_step"]),
+            float(event_row["temp_mean"]),
+            float(event_row["temp_std"]),
+            float(event_row["vib_mean"]),
+            float(event_row["vib_std"]),
+            float(event_row["vib_rms"]),
         ),
     )
     con.commit()
@@ -331,8 +508,16 @@ def upsert_incident(con, d: dict, severity: str):
               if_score_min,
               if_score_max,
               temp_zscore_max,
-              payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              payload_json,
+              window_start_index_first,
+              window_end_index_first,
+              window_start_index_last,
+              window_end_index_last,
+              window_start_ts_first,
+              window_end_ts_first,
+              window_start_ts_last,
+              window_end_ts_last
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 incident_id,
@@ -354,6 +539,14 @@ def upsert_incident(con, d: dict, severity: str):
                 if_score,
                 temp_zscore,
                 payload_json,
+                int(d["window_start_index"]),
+                int(d["window_end_index"]),
+                int(d["window_start_index"]),
+                int(d["window_end_index"]),
+                d["window_start_ts"],
+                d["window_end_ts"],
+                d["window_start_ts"],
+                d["window_end_ts"],
             ),
         )
         con.commit()
@@ -391,7 +584,11 @@ def upsert_incident(con, d: dict, severity: str):
             if_score_min = ?,
             if_score_max = ?,
             temp_zscore_max = ?,
-            payload_json = ?
+            payload_json = ?,
+            window_start_index_last = ?,
+            window_end_index_last = ?,
+            window_start_ts_last = ?,
+            window_end_ts_last = ?
         WHERE incident_id = ?
         """,
         (
@@ -407,6 +604,10 @@ def upsert_incident(con, d: dict, severity: str):
             max(float(if_score_max), if_score),
             max(float(temp_zscore_max), temp_zscore),
             json.dumps(d, separators=(",", ":")),
+            int(d["window_start_index"]),
+            int(d["window_end_index"]),
+            d["window_start_ts"],
+            d["window_end_ts"],
             incident_id,
         ),
     )
@@ -440,18 +641,22 @@ def on_connect(client, userdata, flags, rc, properties=None):
 def on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode("utf-8", errors="replace")
-        d = json.loads(payload)
+        raw = json.loads(payload)
     except Exception as e:
         log(f"[WARN] invalid json: {e}")
         return
 
     required = [
         "ts_inference",
-        "ts_gateway",
+        "window_start_ts",
+        "window_end_ts",
         "factory_id",
         "machine_id",
         "device_id",
-        "reading_index",
+        "window_start_index",
+        "window_end_index",
+        "window_size",
+        "window_step",
         "if_score",
         "if_pred",
         "is_anomaly_ml",
@@ -461,9 +666,11 @@ def on_message(client, userdata, msg):
         "anomaly_reason",
     ]
     for k in required:
-        if k not in d:
+        if k not in raw:
             log(f"[WARN] missing field: {k}")
             return
+
+    d = normalize_window_payload(raw)
 
     dev = d["device_id"]
     st = get_state(dev)
@@ -475,7 +682,6 @@ def on_message(client, userdata, msg):
     is_final = int(d["is_anomaly_final"])
     severity = severity_from_result(d)
 
-    # Hysteresis counters
     if is_final == 1:
         st["anom_run"] += 1
         st["norm_run"] = 0
@@ -486,22 +692,25 @@ def on_message(client, userdata, msg):
     if DEBUG_LOG_EVERY_MESSAGE:
         cooldown_str = cooldown_until.isoformat() if cooldown_until is not None else "None"
         log(
-            f"[DEBUG] device={dev} idx={d['reading_index']} "
-            f"is_final={is_final} anom_run={st['anom_run']} norm_run={st['norm_run']} "
+            f"[DEBUG] device={dev} "
+            f"win={d['window_start_index']}-{d['window_end_index']} "
+            f"idx={d['reading_index']} "
+            f"is_final={is_final} "
+            f"anom_run={st['anom_run']} norm_run={st['norm_run']} "
             f"in_cooldown={in_cooldown} cooldown_until={cooldown_str} "
             f"reason={d['anomaly_reason']} severity={severity}"
         )
 
-    # OPEN / UPSERT incident only when threshold is first reached
+    # Open/update incident only when threshold is first reached
     if is_final == 1 and st["anom_run"] == OPEN_N and not in_cooldown:
         event_row = {
             "ts_event": now_iso(),
             "ts_inference": d["ts_inference"],
-            "ts_gateway": d["ts_gateway"],
+            "ts_gateway": d["ts_gateway"],  # compatibility = window_end_ts
             "factory_id": d["factory_id"],
             "machine_id": d["machine_id"],
             "device_id": d["device_id"],
-            "reading_index": int(d["reading_index"]),
+            "reading_index": int(d["reading_index"]),  # compatibility = window_end_index
             "severity": severity,
             "anomaly_reason": d["anomaly_reason"],
             "if_score": float(d["if_score"]),
@@ -510,13 +719,27 @@ def on_message(client, userdata, msg):
             "temp_zscore": float(d["temp_zscore"]),
             "is_anomaly_ewma": int(d["is_anomaly_ewma"]),
             "is_anomaly_final": int(d["is_anomaly_final"]),
+            "window_start_ts": d["window_start_ts"],
+            "window_end_ts": d["window_end_ts"],
+            "window_start_index": int(d["window_start_index"]),
+            "window_end_index": int(d["window_end_index"]),
+            "window_size": int(d["window_size"]),
+            "window_step": int(d["window_step"]),
+            "temp_mean": float(d.get("temp_mean", 0.0)),
+            "temp_std": float(d.get("temp_std", 0.0)),
+            "vib_mean": float(d.get("vib_mean", 0.0)),
+            "vib_std": float(d.get("vib_std", 0.0)),
+            "vib_rms": float(d.get("vib_rms", 0.0)),
         }
 
         try:
             retry_db_write(insert_event, db_con, event_row)
             incident_id, incident_action = retry_db_write(upsert_incident, db_con, d, severity)
         except Exception as e:
-            log(f"[ERROR] db write failed for device={dev} idx={d['reading_index']} error={e}")
+            log(
+                f"[ERROR] db write failed for device={dev} "
+                f"win={d['window_start_index']}-{d['window_end_index']} error={e}"
+            )
             return
 
         downstream = {
@@ -526,6 +749,10 @@ def on_message(client, userdata, msg):
             "machine_id": d["machine_id"],
             "device_id": d["device_id"],
             "reading_index": int(d["reading_index"]),
+            "window_start_index": int(d["window_start_index"]),
+            "window_end_index": int(d["window_end_index"]),
+            "window_start_ts": d["window_start_ts"],
+            "window_end_ts": d["window_end_ts"],
             "severity": severity,
             "anomaly_reason": d["anomaly_reason"],
             "if_score": float(d["if_score"]),
@@ -538,23 +765,25 @@ def on_message(client, userdata, msg):
 
         log(
             f"[EVENT] {incident_action.lower()} incident "
-            f"device={dev} idx={d['reading_index']} "
+            f"device={dev} "
+            f"win={d['window_start_index']}-{d['window_end_index']} "
             f"severity={severity} reason={d['anomaly_reason']}"
         )
 
     elif is_final == 1 and st["anom_run"] > OPEN_N and not in_cooldown:
         log(
             f"[DEBUG] anomaly streak continuing "
-            f"device={dev} idx={d['reading_index']} anom_run={st['anom_run']}"
+            f"device={dev} win={d['window_start_index']}-{d['window_end_index']} "
+            f"anom_run={st['anom_run']}"
         )
 
     elif is_final == 1 and in_cooldown:
         log(
             f"[DEBUG] anomaly ignored due to cooldown "
-            f"device={dev} idx={d['reading_index']}"
+            f"device={dev} win={d['window_start_index']}-{d['window_end_index']}"
         )
 
-    # RESOLVE after M consecutive normal messages
+    # Resolve after M consecutive normal windows
     if is_final == 0 and st["norm_run"] >= RESOLVE_M:
         try:
             updated = retry_db_write(resolve_incident, db_con, dev)
@@ -574,6 +803,10 @@ def on_message(client, userdata, msg):
                 "machine_id": d["machine_id"],
                 "device_id": d["device_id"],
                 "reading_index": int(d["reading_index"]),
+                "window_start_index": int(d["window_start_index"]),
+                "window_end_index": int(d["window_end_index"]),
+                "window_start_ts": d["window_start_ts"],
+                "window_end_ts": d["window_end_ts"],
                 "severity": "info",
                 "anomaly_reason": "normal",
                 "if_score": float(d["if_score"]),
@@ -585,8 +818,6 @@ def on_message(client, userdata, msg):
             client.publish(OUTPUT_TOPIC, json.dumps(downstream), qos=0, retain=False)
             log(f"[EVENT] resolved incident device={dev}")
         else:
-            # No open incident existed, so do NOT enter cooldown.
-            # Just reset counters so the normal warm-up phase does not keep retriggering.
             st["norm_run"] = 0
             st["anom_run"] = 0
             log(f"[DEBUG] resolve threshold reached but no OPEN incident existed for device={dev}")
