@@ -53,12 +53,12 @@ const char* deviceId = "esp32-001";
 bool FORCE_ANOMALY = true;
 
 // Start anomaly burst after this reading index.
-const uint32_t FORCE_ANOMALY_FROM = 100;
+const uint32_t FORCE_ANOMALY_FROM = 200;
 
 // Number of consecutive anomalous readings to send.
 // event_processing needs 3 consecutive anomaly messages,
 // so 5 gives some safety margin.
-const uint32_t FORCE_ANOMALY_COUNT = 200;
+const uint32_t FORCE_ANOMALY_COUNT = 400;
 
 // Forced anomaly values
 const float FORCED_TEMP_C = 85.0f;
@@ -94,8 +94,8 @@ PubSubClient mqttClient(espClient);
 // ======================================================
 // TIMING
 // ======================================================
-// Publish accelerometer data at 50 Hz
-const unsigned long publishIntervalMs = 20;
+// Publish accelerometer + latest temperature at 100 Hz
+const unsigned long publishIntervalMs = 10;
 
 // Read temperature asynchronously every 1 second
 const unsigned long tempRequestIntervalMs = 1000;
@@ -412,7 +412,7 @@ void loop() {
     bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      if (readingIndex % 20 == 0 || isForcedAnomalyReading(readingIndex)) {
+      if (readingIndex % 50 == 0 || isForcedAnomalyReading(readingIndex)) {
         Serial.print("Published reading ");
         Serial.print(readingIndex);
 

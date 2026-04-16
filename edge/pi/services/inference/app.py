@@ -34,7 +34,7 @@ INPUT_TOPIC = os.getenv("INFERENCE_INPUT_TOPIC", "mva/normalized/telemetry")
 OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
 MODEL_PATH = os.path.expanduser(
-    os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/training/if_window_model.joblib")
+    os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/training/if_window_model_100hz.joblib")
 )
 
 # Turn on only when debugging
@@ -63,8 +63,8 @@ DISABLE_ML_WHEN_UNUSED = os.getenv("DISABLE_ML_WHEN_UNUSED", "true").lower() == 
 # At 50 Hz:
 #   WINDOW_SIZE = 50  -> 1.0 second
 #   WINDOW_STEP = 25  -> new ML result every 0.5 seconds
-WINDOW_SIZE = int(os.getenv("INFERENCE_WINDOW_SIZE", "50"))
-WINDOW_STEP = int(os.getenv("INFERENCE_WINDOW_STEP", "25"))
+WINDOW_SIZE = int(os.getenv("INFERENCE_WINDOW_SIZE", "100"))
+WINDOW_STEP = int(os.getenv("INFERENCE_WINDOW_STEP", "50"))
 
 # Keep enough recent samples per device
 MAX_BUFFER_SIZE = max(WINDOW_SIZE * 3, WINDOW_SIZE + WINDOW_STEP + 10)

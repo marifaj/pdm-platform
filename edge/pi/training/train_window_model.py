@@ -10,17 +10,17 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 INPUT_CSV = os.path.expanduser(
-    os.getenv("TRAINING_INPUT_CSV", "~/mva/data/telemetry_training_combined_windowed.csv")
+    os.getenv("TRAINING_INPUT_CSV", "~/mva/models/training/telemetry_training_combined_windowed.csv")
 )
 OUTPUT_MODEL = os.path.expanduser(
-    os.getenv("TRAINING_OUTPUT_MODEL", "~/mva/models/if_window_model.joblib")
+    os.getenv("TRAINING_OUTPUT_MODEL", "~/mva/models/training/if_window_model_100hz.joblib")
 )
 OUTPUT_FEATURES_CSV = os.path.expanduser(
-    os.getenv("TRAINING_OUTPUT_FEATURES_CSV", "~/mva/data/window_features.csv")
+    os.getenv("TRAINING_OUTPUT_FEATURES_CSV", "~/mva/models/training/window_features_100hz.csv")
 )
 
-WINDOW_SIZE = int(os.getenv("TRAINING_WINDOW_SIZE", "50"))
-WINDOW_STEP = int(os.getenv("TRAINING_WINDOW_STEP", "25"))
+WINDOW_SIZE = int(os.getenv("TRAINING_WINDOW_SIZE", "100"))
+WINDOW_STEP = int(os.getenv("TRAINING_WINDOW_STEP", "50"))
 
 N_ESTIMATORS = int(os.getenv("IF_N_ESTIMATORS", "200"))
 CONTAMINATION = float(os.getenv("IF_CONTAMINATION", "0.02"))
