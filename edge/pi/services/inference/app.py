@@ -53,17 +53,16 @@ DETECTION_MODE = "hybrid"
 #   2 = run ML on every 2nd message
 ML_RUN_EVERY_N = 1
 
+# If True and DETECTION_MODE == "ewma_only", ML is not executed at all.
+# This gives you a true EWMA-only ablation for CPU and behavior.
+DISABLE_ML_WHEN_UNUSED = True
+
 # Store every Nth inference result to SQLite
 INFERENCE_SAVE_EVERY_N = 10
 
 # Dynamic logging
-# During normal operation, log every N messages
 NORMAL_LOG_EVERY_N = 500
-
-# During anomaly periods, log every N messages
 ANOMALY_LOG_EVERY_N = 5
-
-# Force full debug logging for every message
 DEBUG_LOG_EVERY_MESSAGE = False
 
 FEATURE_COLUMNS = [
@@ -257,6 +256,12 @@ log(f"[BOOT] inference_results table ensured at {DB_PATH}")
 # ============================================================
 # MODEL LOADING
 # ============================================================
+def should_load_model() -> bool:
+    if DETECTION_MODE == "ewma_only" and DISABLE_ML_WHEN_UNUSED:
+        return False
+    return True
+
+
 def load_model():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
@@ -265,11 +270,15 @@ def load_model():
     return m
 
 
-try:
-    model = load_model()
-except Exception as e:
-    log(f"[FATAL] failed to load model: {e}")
-    raise
+model = None
+if should_load_model():
+    try:
+        model = load_model()
+    except Exception as e:
+        log(f"[FATAL] failed to load model: {e}")
+        raise
+else:
+    log("[BOOT] model loading skipped (EWMA-only mode with DISABLE_ML_WHEN_UNUSED=True)")
 
 
 # ============================================================
@@ -423,7 +432,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
     log(f"[MQTT] connected rc={rc}")
     client.subscribe(INPUT_TOPIC, qos=1)
     log(f"[MQTT] subscribed to {INPUT_TOPIC}")
-    log(f"[BOOT] DETECTION_MODE={DETECTION_MODE} ML_RUN_EVERY_N={ML_RUN_EVERY_N}")
+    log(
+        f"[BOOT] DETECTION_MODE={DETECTION_MODE} "
+        f"ML_RUN_EVERY_N={ML_RUN_EVERY_N} "
+        f"DISABLE_ML_WHEN_UNUSED={DISABLE_ML_WHEN_UNUSED}"
+    )
 
 
 def on_message(client, userdata, msg):
@@ -451,18 +464,27 @@ def on_message(client, userdata, msg):
         temp_c = row["temperature_c"]
         temp_ewma, temp_residual, temp_zscore, is_anomaly_ewma = temp_monitor.update(temp_c)
 
-        # ML runs every Nth message; default is every message
-        run_ml_now = (ML_RUN_EVERY_N <= 1) or (reading_index % ML_RUN_EVERY_N == 0)
+        # Decide whether ML is needed at all for this mode
+        ml_needed_for_mode = not (DETECTION_MODE == "ewma_only" and DISABLE_ML_WHEN_UNUSED)
 
-        if run_ml_now:
-            X = make_feature_frame(row)
-            if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
-            set_last_ml_state(device_id, if_score, if_pred, is_anomaly_ml)
-        else:
-            ml_state = get_last_ml_state(device_id)
-            if_score = float(ml_state["if_score"])
-            if_pred = int(ml_state["if_pred"])
-            is_anomaly_ml = int(ml_state["is_anomaly_ml"])
+        # Default ML outputs when ML is skipped entirely
+        if_score = 0.0
+        if_pred = 1
+        is_anomaly_ml = 0
+        run_ml_now = False
+
+        if ml_needed_for_mode:
+            run_ml_now = (ML_RUN_EVERY_N <= 1) or (reading_index % ML_RUN_EVERY_N == 0)
+
+            if run_ml_now:
+                X = make_feature_frame(row)
+                if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
+                set_last_ml_state(device_id, if_score, if_pred, is_anomaly_ml)
+            else:
+                ml_state = get_last_ml_state(device_id)
+                if_score = float(ml_state["if_score"])
+                if_pred = int(ml_state["if_pred"])
+                is_anomaly_ml = int(ml_state["is_anomaly_ml"])
 
         # Final decision according to ablation mode
         is_anomaly_final, anomaly_reason = combine_decision(
@@ -515,6 +537,7 @@ def on_message(client, userdata, msg):
             log(
                 f"[DEBUG] idx={reading_index} "
                 f"mode={DETECTION_MODE} "
+                f"ml_needed={ml_needed_for_mode} "
                 f"ml_run={run_ml_now} "
                 f"if_score={if_score:.4f} "
                 f"ml={is_anomaly_ml} ewma={is_anomaly_ewma} "
@@ -528,6 +551,7 @@ def on_message(client, userdata, msg):
                     log(
                         f"[ANOM] idx={reading_index} "
                         f"mode={DETECTION_MODE} "
+                        f"ml_needed={ml_needed_for_mode} "
                         f"ml_run={run_ml_now} "
                         f"if_score={if_score:.4f} "
                         f"ml={is_anomaly_ml} "
@@ -540,6 +564,7 @@ def on_message(client, userdata, msg):
                     log(
                         f"[INF] idx={reading_index} "
                         f"mode={DETECTION_MODE} "
+                        f"ml_needed={ml_needed_for_mode} "
                         f"ml_run={run_ml_now} "
                         f"if_score={if_score:.4f} "
                         f"ml={is_anomaly_ml} "
