@@ -34,11 +34,11 @@ INPUT_TOPIC = os.getenv("INFERENCE_INPUT_TOPIC", "mva/normalized/telemetry")
 OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
 MODEL_PATH = os.path.expanduser(
-    os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/if_window_model.joblib")
+    os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/training/if_window_model.joblib")
 )
 
 # Turn on only when debugging
-ENABLE_CONSOLE_LOGGING = False
+ENABLE_CONSOLE_LOGGING = os.getenv("INFERENCE_ENABLE_CONSOLE_LOGGING", "false").lower() == "true"
 
 # ============================================================
 # DETECTION SETTINGS
@@ -47,15 +47,15 @@ ENABLE_CONSOLE_LOGGING = False
 #   "ewma_only"
 #   "ml_only"
 #   "hybrid"
-DETECTION_MODE = "hybrid"
+DETECTION_MODE = os.getenv("DETECTION_MODE", "hybrid").strip().lower()
 
 # For hybrid mode:
 # True  -> anomaly if either ML or EWMA says anomaly
 # False -> anomaly only if both say anomaly
-HYBRID_USE_OR = True
+HYBRID_USE_OR = os.getenv("HYBRID_USE_OR", "true").lower() == "true"
 
 # If True and DETECTION_MODE == "ewma_only", model is not loaded at all.
-DISABLE_ML_WHEN_UNUSED = True
+DISABLE_ML_WHEN_UNUSED = os.getenv("DISABLE_ML_WHEN_UNUSED", "true").lower() == "true"
 
 # ============================================================
 # WINDOW SETTINGS
@@ -72,7 +72,7 @@ MAX_BUFFER_SIZE = max(WINDOW_SIZE * 3, WINDOW_SIZE + WINDOW_STEP + 10)
 # ============================================================
 # WINDOW FEATURE COLUMNS
 # IMPORTANT:
-# The trained ML model must be trained using these exact columns.
+# The trained ML artifact must use these exact columns.
 # ============================================================
 FEATURE_COLUMNS = [
     "temp_mean",
@@ -129,9 +129,48 @@ def should_load_model() -> bool:
 def load_model():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Window model file not found: {MODEL_PATH}")
-    m = joblib.load(MODEL_PATH)
-    log(f"[BOOT] window model loaded from {MODEL_PATH}")
-    return m
+
+    artifact = joblib.load(MODEL_PATH)
+
+    # Preferred artifact format from train_window_model.py
+    if isinstance(artifact, dict) and "model" in artifact:
+        model_obj = artifact["model"]
+
+        trained_feature_columns = artifact.get("feature_columns")
+        if trained_feature_columns is not None:
+            if list(trained_feature_columns) != FEATURE_COLUMNS:
+                raise ValueError(
+                    "Feature column mismatch between app.py and trained model.\n"
+                    f"App expects: {FEATURE_COLUMNS}\n"
+                    f"Model has:   {trained_feature_columns}"
+                )
+
+        trained_window_size = artifact.get("window_size")
+        trained_window_step = artifact.get("window_step")
+
+        if trained_window_size is not None and int(trained_window_size) != WINDOW_SIZE:
+            raise ValueError(
+                "Window size mismatch between app.py and trained model.\n"
+                f"App uses WINDOW_SIZE={WINDOW_SIZE}\n"
+                f"Model was trained with window_size={trained_window_size}"
+            )
+
+        if trained_window_step is not None and int(trained_window_step) != WINDOW_STEP:
+            raise ValueError(
+                "Window step mismatch between app.py and trained model.\n"
+                f"App uses WINDOW_STEP={WINDOW_STEP}\n"
+                f"Model was trained with window_step={trained_window_step}"
+            )
+
+        log(
+            f"[BOOT] window model artifact loaded from {MODEL_PATH} "
+            f"(window_size={trained_window_size}, window_step={trained_window_step})"
+        )
+        return model_obj
+
+    # Fallback: raw sklearn model
+    log(f"[BOOT] raw model loaded from {MODEL_PATH}")
+    return artifact
 
 
 model = None
@@ -222,11 +261,11 @@ def validate_payload(d: dict):
 
 def normalize_input_row(d: dict):
     return {
-        "factory_id": d["factory_id"],
-        "machine_id": d["machine_id"],
-        "device_id": d["device_id"],
+        "factory_id": str(d["factory_id"]),
+        "machine_id": str(d["machine_id"]),
+        "device_id": str(d["device_id"]),
         "reading_index": int(d["reading_index"]),
-        "ts_gateway": d["ts_gateway"],
+        "ts_gateway": str(d["ts_gateway"]),
         "temperature_c": float(d["temperature_c"]),
         "x_g": float(d["x_g"]),
         "y_g": float(d["y_g"]),
@@ -306,8 +345,8 @@ def combine_decision(is_anomaly_ml: int, is_anomaly_ewma: int):
 # WINDOW / EWMA DECISION LOGIC
 # ============================================================
 def get_window_ewma_flag(window_rows):
-    # Use latest per-message EWMA decision inside the window
-    # You could also use any(window anomaly) if you want more sensitivity.
+    # Current policy:
+    # Use the latest EWMA decision in the window.
     latest = window_rows[-1]
     return int(latest.get("is_anomaly_ewma", 0))
 
@@ -358,7 +397,7 @@ def build_window_result(window_rows, window_features, if_score, if_pred, is_anom
         "if_pred": int(if_pred),
         "is_anomaly_ml": int(is_anomaly_ml),
 
-        # include latest EWMA state from latest message in the window
+        # latest EWMA state within the window
         "temp_ewma": round(float(last_row.get("temp_ewma", 0.0)), 6),
         "temp_residual": round(float(last_row.get("temp_residual", 0.0)), 6),
         "temp_zscore": round(float(last_row.get("temp_zscore", 0.0)), 6),
@@ -375,33 +414,23 @@ def process_window_if_ready(client, device_id: str):
 
     while len(buf) >= WINDOW_SIZE:
         window_rows = list(buf)[:WINDOW_SIZE]
+        window_features = compute_window_features(window_rows)
 
-        # EWMA-only mode
         if DETECTION_MODE == "ewma_only":
             if_score = 0.0
             if_pred = 1
             is_anomaly_ml = 0
-            window_features = compute_window_features(window_rows)
-            result = build_window_result(
-                window_rows=window_rows,
-                window_features=window_features,
-                if_score=if_score,
-                if_pred=if_pred,
-                is_anomaly_ml=is_anomaly_ml,
-            )
-
         else:
-            window_features = compute_window_features(window_rows)
             X = make_feature_frame(window_features)
             if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
 
-            result = build_window_result(
-                window_rows=window_rows,
-                window_features=window_features,
-                if_score=if_score,
-                if_pred=if_pred,
-                is_anomaly_ml=is_anomaly_ml,
-            )
+        result = build_window_result(
+            window_rows=window_rows,
+            window_features=window_features,
+            if_score=if_score,
+            if_pred=if_pred,
+            is_anomaly_ml=is_anomaly_ml,
+        )
 
         client.publish(OUTPUT_TOPIC, json.dumps(result), qos=0, retain=False)
 

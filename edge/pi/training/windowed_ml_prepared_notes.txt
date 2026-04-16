@@ -1,0 +1,22 @@
+Prepared files for windowed ML training and inference
+
+Created from:
+- idle_20260414(2).csv
+- load_20260414(2).csv
+
+Assumptions applied:
+- factory_id = factory-001
+- machine_id = machine-001
+- device_id = esp32-001
+- operating_state = idle or load based on source file
+- label = normal for both source files
+
+Outputs:
+1. telemetry_training_combined_windowed.csv
+   Full training dataset with required identity columns plus operating_state and label.
+2. telemetry_training_combined_minimal.csv
+   Minimal version containing only the columns required by the trainer.
+3. app_windowed_inference.py
+   Windowed inference service with MQTT input/output and no SQLite writes.
+4. train_window_model.py
+   Trainer that produces if_window_model.joblib compatible with app_windowed_inference.py

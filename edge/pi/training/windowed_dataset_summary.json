@@ -1,0 +1,19 @@
+{
+  "idle_rows": 63845,
+  "load_rows": 28115,
+  "combined_rows": 91960,
+  "combined_columns": [
+    "factory_id",
+    "machine_id",
+    "device_id",
+    "reading_index",
+    "ts_gateway",
+    "temperature_c",
+    "x_g",
+    "y_g",
+    "z_g",
+    "vibration_mag_g",
+    "operating_state",
+    "label"
+  ]
+}
