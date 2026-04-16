@@ -7,8 +7,10 @@ cd ~/mva
 ./services.sh start-one storage 
 cd ~/mva 
 ./services.sh start-one inference 
-cd ~/mva ./services.sh start-one event_processing 
-cd ~/mva ./services.sh start-one notification
+cd ~/mva 
+./services.sh start-one event_processing 
+cd ~/mva 
+./services.sh start-one notification
 
 start all: 
 cd ~/mva ./services.sh start
@@ -27,3 +29,6 @@ cd ~/mva ./services.sh status
 CHECK HEALTH 
 cd ~/mva 
 ./services.sh health
+
+check performance usage of services:
+ps -eo pid,%cpu,%mem,cmd | grep -E "ingestion|storage|inference|event_processing|notification" | grep -v grep

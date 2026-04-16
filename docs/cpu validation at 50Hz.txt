@@ -1,0 +1,143 @@
+========================================
+ML_RUN_EVERY_N COMPARISON CHECKLIST
+========================================
+
+GOAL:
+Compare performance and behavior between:
+- ML_RUN_EVERY_N = 1
+- ML_RUN_EVERY_N = 2
+
+----------------------------------------
+1. PREPARE (BEFORE EACH RUN)
+----------------------------------------
+
+Stop services:
+
+pkill -f inference/app.py
+pkill -f event_processing/app.py
+pkill -f notification/app.py
+
+(Optional - clean DB):
+
+DELETE FROM telemetry_normalized;
+DELETE FROM inference_results;
+DELETE FROM events;
+DELETE FROM incidents;
+DELETE FROM notifications;
+
+IMPORTANT:
+Make sure DB changes are COMMITTED (not discarded)
+
+----------------------------------------
+2. RUN TEST (5 MINUTES EACH)
+----------------------------------------
+
+Test A:
+ML_RUN_EVERY_N=1
+
+Test B:
+ML_RUN_EVERY_N=2
+
+Steps:
+1. Start all services
+2. Start ESP32 (50 Hz)
+3. Run for 5 minutes
+
+----------------------------------------
+3. CAPTURE CPU
+----------------------------------------
+
+Run during test:
+
+ps -eo pid,%cpu,%mem,cmd --sort=-%cpu | head -10
+
+Record:
+- inference CPU %
+- overall system load (htop/top)
+
+----------------------------------------
+4. CAPTURE COUNTS
+----------------------------------------
+
+Run:
+
+select count(*) from telemetry_normalized;
+select count(*) from inference_results;
+select count(*) from events;
+select count(*) from incidents;
+select count(*) from notifications;
+
+----------------------------------------
+5. CHECK DETECTION BEHAVIOR
+----------------------------------------
+
+From logs, verify:
+
+- OPENED event exists
+- RESOLVE event exists
+
+Record:
+- reading_index of OPENED
+- reading_index of RESOLVE
+
+----------------------------------------
+6. CHECK FOR PROBLEMS
+----------------------------------------
+
+Look for:
+
+- delayed alerts
+- missing alerts
+- repeated alerts (should NOT happen)
+- DB lock warnings
+- crashes or restarts
+
+----------------------------------------
+7. COMPARE RESULTS
+----------------------------------------
+
+Fill table:
+
+| Metric            | N=1 | N=2 |
+|------------------|-----|-----|
+| Inference CPU    |     |     |
+| Telemetry count  |     |     |
+| Events           |     |     |
+| Notifications    |     |     |
+| OPENED idx       |     |     |
+| RESOLVE idx      |     |     |
+| Stability        |     |     |
+
+----------------------------------------
+8. DECISION RULE
+----------------------------------------
+
+Choose ML_RUN_EVERY_N=2 IF:
+- CPU drops ≥20–30%
+- OPENED/RESOLVE still occur
+- delay is small
+
+Stay with ML_RUN_EVERY_N=1 IF:
+- anomalies are missed
+- alerts delayed too much
+- behavior inconsistent
+
+----------------------------------------
+9. OPTIONAL (LIVE CPU WATCH)
+----------------------------------------
+
+watch -n 2 "ps -eo %cpu,cmd | grep inference | grep -v grep"
+
+----------------------------------------
+KEY INSIGHT
+----------------------------------------
+
+You are validating:
+"Does the system still detect incidents correctly?"
+
+NOT:
+"Does ML evaluate every single sample?"
+
+========================================
+END OF CHECKLIST
+========================================

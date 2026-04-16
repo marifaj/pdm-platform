@@ -12,6 +12,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import pandas as pd
 import paho.mqtt.client as mqtt
 
 # ---- optional .env auto-load ----
@@ -35,10 +36,35 @@ OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
 MODEL_PATH = os.path.expanduser(os.getenv("INFERENCE_MODEL_PATH", "~/mva/models/if_model.joblib"))
 DB_PATH = os.path.expanduser(os.getenv("INFERENCE_DB_PATH", "~/mva/data/mva.db"))
-LOG_PATH = os.path.expanduser("~/mva/logs/inference.log")
+LOG_PATH = os.path.expanduser(os.getenv("INFERENCE_LOG_PATH", "~/mva/logs/inference.log"))
+
+# ============================================================
+# EXPERIMENT SETTINGS (EDIT THESE INSIDE THE FILE)
+# ============================================================
+
+# Allowed values:
+#   "ewma_only"
+#   "ml_only"
+#   "hybrid"
+DETECTION_MODE = "hybrid"
+
+# ML execution frequency:
+#   1 = run ML on every message
+#   2 = run ML on every 2nd message
+ML_RUN_EVERY_N = 1
 
 # Store every Nth inference result to SQLite
-INFERENCE_SAVE_EVERY_N = int(os.getenv("INFERENCE_SAVE_EVERY_N", "10"))
+INFERENCE_SAVE_EVERY_N = 10
+
+# Dynamic logging
+# During normal operation, log every N messages
+NORMAL_LOG_EVERY_N = 500
+
+# During anomaly periods, log every N messages
+ANOMALY_LOG_EVERY_N = 5
+
+# Force full debug logging for every message
+DEBUG_LOG_EVERY_MESSAGE = False
 
 FEATURE_COLUMNS = [
     "temperature_c",
@@ -54,10 +80,10 @@ EWMA_WINDOW_SIZE = int(os.getenv("EWMA_WINDOW_SIZE", "200"))
 EWMA_Z_THRESHOLD = float(os.getenv("EWMA_Z_THRESHOLD", "3.0"))
 EWMA_MIN_STD = float(os.getenv("EWMA_MIN_STD", "0.05"))
 
-# Hybrid decision mode:
-# true  -> final anomaly if either ML or EWMA says anomaly
-# false -> final anomaly only if both say anomaly
-HYBRID_USE_OR = os.getenv("HYBRID_USE_OR", "true").lower() == "true"
+# For hybrid mode:
+# True  -> final anomaly if either ML or EWMA says anomaly
+# False -> final anomaly only if both say anomaly
+HYBRID_USE_OR = True
 
 
 # ============================================================
@@ -313,28 +339,28 @@ def validate_payload(d: dict):
     return True, "ok"
 
 
-def extract_features(d: dict):
+def extract_feature_row(d: dict):
     try:
-        vals = np.array(
-            [
-                float(d["temperature_c"]),
-                float(d["x_g"]),
-                float(d["y_g"]),
-                float(d["z_g"]),
-                float(d["vibration_mag_g"]),
-            ],
-            dtype=float,
-        ).reshape(1, -1)
-        return vals
+        return {
+            "temperature_c": float(d["temperature_c"]),
+            "x_g": float(d["x_g"]),
+            "y_g": float(d["y_g"]),
+            "z_g": float(d["z_g"]),
+            "vibration_mag_g": float(d["vibration_mag_g"]),
+        }
     except Exception as e:
         log(f"[WARN] feature extraction failed: {e}")
         return None
 
 
+def make_feature_frame(row: dict) -> pd.DataFrame:
+    return pd.DataFrame([row], columns=FEATURE_COLUMNS)
+
+
 # ============================================================
 # INFERENCE LOGIC
 # ============================================================
-def run_ml_inference(X: np.ndarray):
+def run_ml_inference(X: pd.DataFrame):
     score = float(model.decision_function(X)[0])  # higher = more normal
     pred = int(model.predict(X)[0])               # 1 = normal, -1 = anomaly
     is_anomaly_ml = 1 if pred == -1 else 0
@@ -342,10 +368,15 @@ def run_ml_inference(X: np.ndarray):
 
 
 def combine_decision(is_anomaly_ml: int, is_anomaly_ewma: int):
-    if HYBRID_USE_OR:
-        is_final = 1 if (is_anomaly_ml or is_anomaly_ewma) else 0
+    if DETECTION_MODE == "ewma_only":
+        is_final = is_anomaly_ewma
+    elif DETECTION_MODE == "ml_only":
+        is_final = is_anomaly_ml
     else:
-        is_final = 1 if (is_anomaly_ml and is_anomaly_ewma) else 0
+        if HYBRID_USE_OR:
+            is_final = 1 if (is_anomaly_ml or is_anomaly_ewma) else 0
+        else:
+            is_final = 1 if (is_anomaly_ml and is_anomaly_ewma) else 0
 
     if is_anomaly_ml and is_anomaly_ewma:
         reason = "ml_and_ewma"
@@ -359,6 +390,32 @@ def combine_decision(is_anomaly_ml: int, is_anomaly_ewma: int):
     return is_final, reason
 
 
+# Cache last ML result if ML_RUN_EVERY_N > 1
+last_ml_state_by_device = {}
+# structure:
+# last_ml_state_by_device[device_id] = {
+#   "if_score": float,
+#   "if_pred": int,
+#   "is_anomaly_ml": int
+# }
+
+
+def get_last_ml_state(device_id: str):
+    return last_ml_state_by_device.get(device_id, {
+        "if_score": 0.0,
+        "if_pred": 1,
+        "is_anomaly_ml": 0,
+    })
+
+
+def set_last_ml_state(device_id: str, if_score: float, if_pred: int, is_anomaly_ml: int):
+    last_ml_state_by_device[device_id] = {
+        "if_score": if_score,
+        "if_pred": if_pred,
+        "is_anomaly_ml": is_anomaly_ml,
+    }
+
+
 # ============================================================
 # MQTT CALLBACKS
 # ============================================================
@@ -366,6 +423,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     log(f"[MQTT] connected rc={rc}")
     client.subscribe(INPUT_TOPIC, qos=1)
     log(f"[MQTT] subscribed to {INPUT_TOPIC}")
+    log(f"[BOOT] DETECTION_MODE={DETECTION_MODE} ML_RUN_EVERY_N={ML_RUN_EVERY_N}")
 
 
 def on_message(client, userdata, msg):
@@ -381,19 +439,32 @@ def on_message(client, userdata, msg):
         log(f"[WARN] invalid normalized payload: {why}")
         return
 
-    X = extract_features(d)
-    if X is None:
+    row = extract_feature_row(d)
+    if row is None:
         return
 
     try:
-        # ML inference
-        if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
+        device_id = d["device_id"]
+        reading_index = int(d["reading_index"])
 
-        # EWMA on temperature
-        temp_c = float(d["temperature_c"])
+        # EWMA runs every message
+        temp_c = row["temperature_c"]
         temp_ewma, temp_residual, temp_zscore, is_anomaly_ewma = temp_monitor.update(temp_c)
 
-        # Final hybrid decision
+        # ML runs every Nth message; default is every message
+        run_ml_now = (ML_RUN_EVERY_N <= 1) or (reading_index % ML_RUN_EVERY_N == 0)
+
+        if run_ml_now:
+            X = make_feature_frame(row)
+            if_score, if_pred, is_anomaly_ml = run_ml_inference(X)
+            set_last_ml_state(device_id, if_score, if_pred, is_anomaly_ml)
+        else:
+            ml_state = get_last_ml_state(device_id)
+            if_score = float(ml_state["if_score"])
+            if_pred = int(ml_state["if_pred"])
+            is_anomaly_ml = int(ml_state["is_anomaly_ml"])
+
+        # Final decision according to ablation mode
         is_anomaly_final, anomaly_reason = combine_decision(
             is_anomaly_ml=is_anomaly_ml,
             is_anomaly_ewma=is_anomaly_ewma,
@@ -403,15 +474,15 @@ def on_message(client, userdata, msg):
             "ts_inference": now_iso_ms(),
             "factory_id": d["factory_id"],
             "machine_id": d["machine_id"],
-            "device_id": d["device_id"],
-            "reading_index": int(d["reading_index"]),
+            "device_id": device_id,
+            "reading_index": reading_index,
             "ts_gateway": d["ts_gateway"],
 
-            "temperature_c": temp_c,
-            "x_g": float(d["x_g"]),
-            "y_g": float(d["y_g"]),
-            "z_g": float(d["z_g"]),
-            "vibration_mag_g": float(d["vibration_mag_g"]),
+            "temperature_c": row["temperature_c"],
+            "x_g": row["x_g"],
+            "y_g": row["y_g"],
+            "z_g": row["z_g"],
+            "vibration_mag_g": row["vibration_mag_g"],
 
             "if_score": if_score,
             "if_pred": if_pred,
@@ -430,24 +501,52 @@ def on_message(client, userdata, msg):
         client.publish(OUTPUT_TOPIC, json.dumps(result), qos=0, retain=False)
 
         # Store only every Nth result to SQLite
-        if int(result["reading_index"]) % INFERENCE_SAVE_EVERY_N == 0:
+        if reading_index % INFERENCE_SAVE_EVERY_N == 0:
             try:
                 insert_inference_result(db_con, result)
             except Exception as e:
                 log(
                     f"[ERROR] failed to store inference result "
-                    f"idx={result['reading_index']} error={e}"
+                    f"idx={reading_index} error={e}"
                 )
 
-        if int(d["reading_index"]) % 100 == 0:
+        # Dynamic logging
+        if DEBUG_LOG_EVERY_MESSAGE:
             log(
-                f"[INF] idx={d['reading_index']} "
+                f"[DEBUG] idx={reading_index} "
+                f"mode={DETECTION_MODE} "
+                f"ml_run={run_ml_now} "
                 f"if_score={if_score:.4f} "
-                f"ml={is_anomaly_ml} "
-                f"ewma={is_anomaly_ewma} "
-                f"final={is_anomaly_final} "
-                f"reason={anomaly_reason}"
+                f"ml={is_anomaly_ml} ewma={is_anomaly_ewma} "
+                f"final={is_anomaly_final} reason={anomaly_reason}"
             )
+        else:
+            is_interesting = is_anomaly_final == 1
+
+            if is_interesting:
+                if reading_index % ANOMALY_LOG_EVERY_N == 0:
+                    log(
+                        f"[ANOM] idx={reading_index} "
+                        f"mode={DETECTION_MODE} "
+                        f"ml_run={run_ml_now} "
+                        f"if_score={if_score:.4f} "
+                        f"ml={is_anomaly_ml} "
+                        f"ewma={is_anomaly_ewma} "
+                        f"final={is_anomaly_final} "
+                        f"reason={anomaly_reason}"
+                    )
+            else:
+                if reading_index % NORMAL_LOG_EVERY_N == 0:
+                    log(
+                        f"[INF] idx={reading_index} "
+                        f"mode={DETECTION_MODE} "
+                        f"ml_run={run_ml_now} "
+                        f"if_score={if_score:.4f} "
+                        f"ml={is_anomaly_ml} "
+                        f"ewma={is_anomaly_ewma} "
+                        f"final={is_anomaly_final} "
+                        f"reason={anomaly_reason}"
+                    )
 
     except Exception as e:
         log(f"[ERROR] inference failed: {e}")
