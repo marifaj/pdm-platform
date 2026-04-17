@@ -49,15 +49,36 @@ const char* deviceId = "esp32-001";
 // ======================================================
 // ANOMALY SIMULATION CONFIG
 // ======================================================
-// Set to true to inject simulated anomaly values for testing.
-bool FORCE_ANOMALY = true;
+// Experiment cases:
+//   baseline            -> FORCE_ANOMALY=false
+//   temperature only    -> FORCE_ANOMALY=true, FORCE_ANOMALY_MODE=ANOM_TEMP_ONLY
+//   vibration only      -> FORCE_ANOMALY=true, FORCE_ANOMALY_MODE=ANOM_VIB_ONLY
+//   both                -> FORCE_ANOMALY=true, FORCE_ANOMALY_MODE=ANOM_BOTH
+//
+// Suggested 100 Hz main-paper runs:
+//   baseline: FORCE_ANOMALY=false
+//   sustained tests: FORCE_ANOMALY_FROM=2000, FORCE_ANOMALY_COUNT=400
+//   short burst: FORCE_ANOMALY_COUNT=10
+//   single spike: FORCE_ANOMALY_COUNT=1
+
+enum AnomalyMode {
+  ANOM_NONE = 0,
+  ANOM_TEMP_ONLY = 1,
+  ANOM_VIB_ONLY = 2,
+  ANOM_BOTH = 3
+};
+
+bool FORCE_ANOMALY = false;
+AnomalyMode FORCE_ANOMALY_MODE = ANOM_NONE;
 
 // Start anomaly burst after this reading index.
-const uint32_t FORCE_ANOMALY_FROM = 200;
+const uint32_t FORCE_ANOMALY_FROM = 2000;
 
 // Number of consecutive anomalous readings to send.
-// event_processing needs 3 consecutive anomaly messages,
-// so 5 gives some safety margin.
+// For 100 Hz main tests:
+//   1    = single spike
+//   10   = short burst
+//   400  = sustained burst (~4 seconds)
 const uint32_t FORCE_ANOMALY_COUNT = 400;
 
 // Forced anomaly values
@@ -118,6 +139,21 @@ bool isForcedAnomalyReading(uint32_t idx) {
   return FORCE_ANOMALY &&
          idx >= FORCE_ANOMALY_FROM &&
          idx < (FORCE_ANOMALY_FROM + FORCE_ANOMALY_COUNT);
+}
+
+const char* anomalyModeToString(AnomalyMode mode) {
+  switch (mode) {
+    case ANOM_NONE:
+      return "none";
+    case ANOM_TEMP_ONLY:
+      return "temp_only";
+    case ANOM_VIB_ONLY:
+      return "vib_only";
+    case ANOM_BOTH:
+      return "both";
+    default:
+      return "unknown";
+  }
 }
 
 void connectWiFi() {
@@ -339,6 +375,8 @@ void setup() {
   Serial.println("------------------------------------");
   Serial.print("FORCE_ANOMALY = ");
   Serial.println(FORCE_ANOMALY ? "true" : "false");
+  Serial.print("FORCE_ANOMALY_MODE = ");
+  Serial.println(anomalyModeToString(FORCE_ANOMALY_MODE));
   Serial.print("FORCE_ANOMALY_FROM = ");
   Serial.println(FORCE_ANOMALY_FROM);
   Serial.print("FORCE_ANOMALY_COUNT = ");
@@ -382,20 +420,27 @@ void loop() {
     // If temperature not yet available, publish sentinel
     float tempToSend = isnan(latestTempC) ? -127.0f : latestTempC;
 
-    // Inject anomaly for a short burst of consecutive readings
-    if (isForcedAnomalyReading(readingIndex)) {
-      tempToSend = FORCED_TEMP_C;
-      x_g = FORCED_X_G;
-      y_g = FORCED_Y_G;
-      z_g = FORCED_Z_G;
+    bool anomalyNow = isForcedAnomalyReading(readingIndex);
+
+    if (anomalyNow) {
+      if (FORCE_ANOMALY_MODE == ANOM_TEMP_ONLY || FORCE_ANOMALY_MODE == ANOM_BOTH) {
+        tempToSend = FORCED_TEMP_C;
+      }
+
+      if (FORCE_ANOMALY_MODE == ANOM_VIB_ONLY || FORCE_ANOMALY_MODE == ANOM_BOTH) {
+        x_g = FORCED_X_G;
+        y_g = FORCED_Y_G;
+        z_g = FORCED_Z_G;
+      }
+
       Serial.println(">>> FORCED ANOMALY ACTIVE <<<");
     }
 
-    char payload[320];
+    char payload[384];
     snprintf(
       payload,
       sizeof(payload),
-      "{\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f}",
+      "{\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f,\"mode\":\"%s\"}",
       factoryId,
       machineId,
       deviceId,
@@ -406,18 +451,21 @@ void loop() {
       z,
       x_g,
       y_g,
-      z_g
+      z_g,
+      anomalyNow ? anomalyModeToString(FORCE_ANOMALY_MODE) : "normal"
     );
 
     bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      if (readingIndex % 50 == 0 || isForcedAnomalyReading(readingIndex)) {
+      if (readingIndex % 50 == 0 || anomalyNow) {
         Serial.print("Published reading ");
         Serial.print(readingIndex);
 
-        if (isForcedAnomalyReading(readingIndex)) {
-          Serial.print(" [ANOMALY]");
+        if (anomalyNow) {
+          Serial.print(" [ANOMALY:");
+          Serial.print(anomalyModeToString(FORCE_ANOMALY_MODE));
+          Serial.print("]");
         }
 
         Serial.print(" | TempC=");
