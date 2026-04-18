@@ -68,6 +68,7 @@ enum AnomalyMode {
   ANOM_BOTH = 3
 };
 
+
 bool FORCE_ANOMALY = false;
 AnomalyMode FORCE_ANOMALY_MODE = ANOM_NONE;
 
