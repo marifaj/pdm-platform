@@ -69,18 +69,18 @@ enum AnomalyMode {
 };
 
 
-bool FORCE_ANOMALY = false;
-AnomalyMode FORCE_ANOMALY_MODE = ANOM_NONE;
+bool FORCE_ANOMALY = true;
+AnomalyMode FORCE_ANOMALY_MODE = ANOM_BOTH;
 
 // Start anomaly burst after this reading index.
-const uint32_t FORCE_ANOMALY_FROM = 2000;
+const uint32_t FORCE_ANOMALY_FROM = 90000;
 
 // Number of consecutive anomalous readings to send.
 // For 100 Hz main tests:
 //   1    = single spike
 //   10   = short burst
 //   400  = sustained burst (~4 seconds)
-const uint32_t FORCE_ANOMALY_COUNT = 400;
+const uint32_t FORCE_ANOMALY_COUNT = 60000;
 
 // Forced anomaly values
 const float FORCED_TEMP_C = 85.0f;
