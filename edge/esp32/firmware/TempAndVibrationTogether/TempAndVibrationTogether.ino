@@ -4,6 +4,7 @@
 #include <DallasTemperature.h>
 #include <Wire.h>
 #include <PubSubClient.h>
+#include <math.h>
 
 // ======================================================
 // SENSOR / WIRING NOTES
@@ -49,17 +50,18 @@ const char* deviceId = "esp32-001";
 // ======================================================
 // ANOMALY SIMULATION CONFIG
 // ======================================================
-// Experiment cases:
-//   baseline            -> FORCE_ANOMALY=false
-//   temperature only    -> FORCE_ANOMALY=true, FORCE_ANOMALY_MODE=ANOM_TEMP_ONLY
-//   vibration only      -> FORCE_ANOMALY=true, FORCE_ANOMALY_MODE=ANOM_VIB_ONLY
-//   both                -> FORCE_ANOMALY=true, FORCE_ANOMALY_MODE=ANOM_BOTH
+// 100 Hz publishing -> 100 readings/second
+// 2 hours total     -> 720000 readings
 //
-// Suggested 100 Hz main-paper runs:
-//   baseline: FORCE_ANOMALY=false
-//   sustained tests: FORCE_ANOMALY_FROM=2000, FORCE_ANOMALY_COUNT=400
-//   short burst: FORCE_ANOMALY_COUNT=10
-//   single spike: FORCE_ANOMALY_COUNT=1
+// Planned schedule:
+//  0 - 20 min   : normal
+// 20 - 35 min   : temperature-only anomaly
+// 35 - 45 min   : recovery
+// 45 - 60 min   : vibration-only anomaly
+// 60 - 70 min   : recovery
+// 70 - 85 min   : both temp + vibration anomaly
+// 85 - 105 min  : recovery
+// 105 - 120 min : final normal
 
 enum AnomalyMode {
   ANOM_NONE = 0,
@@ -68,19 +70,22 @@ enum AnomalyMode {
   ANOM_BOTH = 3
 };
 
+bool FORCE_ANOMALY = false;
 
-bool FORCE_ANOMALY = true;
-AnomalyMode FORCE_ANOMALY_MODE = ANOM_BOTH;
+struct AnomalySegment {
+  uint32_t startIndex;
+  uint32_t count;
+  AnomalyMode mode;
+};
 
-// Start anomaly burst after this reading index.
-const uint32_t FORCE_ANOMALY_FROM = 90000;
+const AnomalySegment ANOMALY_SCHEDULE[] = {
+  {120000, 90000, ANOM_TEMP_ONLY},  // 20–35 min
+  {270000, 90000, ANOM_VIB_ONLY},   // 45–60 min
+  {420000, 90000, ANOM_BOTH}        // 70–85 min
+};
 
-// Number of consecutive anomalous readings to send.
-// For 100 Hz main tests:
-//   1    = single spike
-//   10   = short burst
-//   400  = sustained burst (~4 seconds)
-const uint32_t FORCE_ANOMALY_COUNT = 60000;
+const size_t ANOMALY_SCHEDULE_COUNT =
+  sizeof(ANOMALY_SCHEDULE) / sizeof(ANOMALY_SCHEDULE[0]);
 
 // Forced anomaly values
 const float FORCED_TEMP_C = 85.0f;
@@ -119,8 +124,7 @@ PubSubClient mqttClient(espClient);
 // Publish accelerometer + latest temperature at 100 Hz
 const unsigned long publishIntervalMs = 10;
 
-// Read temperature asynchronously every 1 second
-const unsigned long tempRequestIntervalMs = 1000;
+// Read temperature asynchronously
 const unsigned long tempConversionWaitMs = 800; // safe for 12-bit DS18B20
 
 unsigned long lastPublishTime = 0;
@@ -136,12 +140,6 @@ float latestTempC = NAN;
 // ======================================================
 // HELPERS
 // ======================================================
-bool isForcedAnomalyReading(uint32_t idx) {
-  return FORCE_ANOMALY &&
-         idx >= FORCE_ANOMALY_FROM &&
-         idx < (FORCE_ANOMALY_FROM + FORCE_ANOMALY_COUNT);
-}
-
 const char* anomalyModeToString(AnomalyMode mode) {
   switch (mode) {
     case ANOM_NONE:
@@ -154,6 +152,40 @@ const char* anomalyModeToString(AnomalyMode mode) {
       return "both";
     default:
       return "unknown";
+  }
+}
+
+AnomalyMode scheduledAnomalyMode(uint32_t idx) {
+  if (!FORCE_ANOMALY) return ANOM_NONE;
+
+  for (size_t i = 0; i < ANOMALY_SCHEDULE_COUNT; i++) {
+    uint32_t startIdx = ANOMALY_SCHEDULE[i].startIndex;
+    uint32_t endIdx = startIdx + ANOMALY_SCHEDULE[i].count;
+
+    if (idx >= startIdx && idx < endIdx) {
+      return ANOMALY_SCHEDULE[i].mode;
+    }
+  }
+
+  return ANOM_NONE;
+}
+
+void printAnomalySchedule() {
+  Serial.println("Anomaly schedule:");
+  for (size_t i = 0; i < ANOMALY_SCHEDULE_COUNT; i++) {
+    uint32_t startIdx = ANOMALY_SCHEDULE[i].startIndex;
+    uint32_t endIdx = startIdx + ANOMALY_SCHEDULE[i].count - 1;
+
+    Serial.print("  Segment ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(anomalyModeToString(ANOMALY_SCHEDULE[i].mode));
+    Serial.print(" | start=");
+    Serial.print(startIdx);
+    Serial.print(" | end=");
+    Serial.print(endIdx);
+    Serial.print(" | count=");
+    Serial.println(ANOMALY_SCHEDULE[i].count);
   }
 }
 
@@ -317,7 +349,6 @@ void setupDS18B20() {
     Serial.println("WARNING: No DS18B20 detected");
   }
 
-  // Start first async conversion
   tempSensors.requestTemperatures();
   lastTempRequestTime = millis();
   tempConversionInProgress = true;
@@ -376,12 +407,7 @@ void setup() {
   Serial.println("------------------------------------");
   Serial.print("FORCE_ANOMALY = ");
   Serial.println(FORCE_ANOMALY ? "true" : "false");
-  Serial.print("FORCE_ANOMALY_MODE = ");
-  Serial.println(anomalyModeToString(FORCE_ANOMALY_MODE));
-  Serial.print("FORCE_ANOMALY_FROM = ");
-  Serial.println(FORCE_ANOMALY_FROM);
-  Serial.print("FORCE_ANOMALY_COUNT = ");
-  Serial.println(FORCE_ANOMALY_COUNT);
+  printAnomalySchedule();
   Serial.println("------------------------------------");
 }
 
@@ -414,27 +440,41 @@ void loop() {
       return;
     }
 
+    // Do not publish until temperature is valid
+    if (isnan(latestTempC) || latestTempC == DEVICE_DISCONNECTED_C) {
+      return;
+    }
+
+    int16_t rawXToSend = x;
+    int16_t rawYToSend = y;
+    int16_t rawZToSend = z;
+
     float x_g = x * ADXL345_SCALE_G_PER_LSB;
     float y_g = y * ADXL345_SCALE_G_PER_LSB;
     float z_g = z * ADXL345_SCALE_G_PER_LSB;
+    float tempToSend = latestTempC;
 
-    // If temperature not yet available, publish sentinel
-    float tempToSend = isnan(latestTempC) ? -127.0f : latestTempC;
-
-    bool anomalyNow = isForcedAnomalyReading(readingIndex);
+    AnomalyMode modeNow = scheduledAnomalyMode(readingIndex);
+    bool anomalyNow = (modeNow != ANOM_NONE);
 
     if (anomalyNow) {
-      if (FORCE_ANOMALY_MODE == ANOM_TEMP_ONLY || FORCE_ANOMALY_MODE == ANOM_BOTH) {
+      if (modeNow == ANOM_TEMP_ONLY || modeNow == ANOM_BOTH) {
         tempToSend = FORCED_TEMP_C;
       }
 
-      if (FORCE_ANOMALY_MODE == ANOM_VIB_ONLY || FORCE_ANOMALY_MODE == ANOM_BOTH) {
+      if (modeNow == ANOM_VIB_ONLY || modeNow == ANOM_BOTH) {
         x_g = FORCED_X_G;
         y_g = FORCED_Y_G;
         z_g = FORCED_Z_G;
+
+        rawXToSend = (int16_t)lroundf(FORCED_X_G / ADXL345_SCALE_G_PER_LSB);
+        rawYToSend = (int16_t)lroundf(FORCED_Y_G / ADXL345_SCALE_G_PER_LSB);
+        rawZToSend = (int16_t)lroundf(FORCED_Z_G / ADXL345_SCALE_G_PER_LSB);
       }
 
-      Serial.println(">>> FORCED ANOMALY ACTIVE <<<");
+      Serial.print(">>> FORCED ANOMALY ACTIVE: ");
+      Serial.print(anomalyModeToString(modeNow));
+      Serial.println(" <<<");
     }
 
     char payload[384];
@@ -447,13 +487,13 @@ void loop() {
       deviceId,
       (unsigned long)readingIndex,
       tempToSend,
-      x,
-      y,
-      z,
+      rawXToSend,
+      rawYToSend,
+      rawZToSend,
       x_g,
       y_g,
       z_g,
-      anomalyNow ? anomalyModeToString(FORCE_ANOMALY_MODE) : "normal"
+      anomalyNow ? anomalyModeToString(modeNow) : "normal"
     );
 
     bool published = mqttClient.publish(mqttTopic, payload, false);
@@ -465,7 +505,7 @@ void loop() {
 
         if (anomalyNow) {
           Serial.print(" [ANOMALY:");
-          Serial.print(anomalyModeToString(FORCE_ANOMALY_MODE));
+          Serial.print(anomalyModeToString(modeNow));
           Serial.print("]");
         }
 
