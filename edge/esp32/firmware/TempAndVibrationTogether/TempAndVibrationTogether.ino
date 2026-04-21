@@ -408,6 +408,9 @@ void setup() {
   Serial.print("FORCE_ANOMALY = ");
   Serial.println(FORCE_ANOMALY ? "true" : "false");
   printAnomalySchedule();
+  if (!FORCE_ANOMALY) {
+    Serial.println("Manual anomaly mode: use physical disturbances only");
+  }
   Serial.println("------------------------------------");
 }
 
@@ -418,6 +421,7 @@ void loop() {
   ArduinoOTA.handle();
 
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected -> reconnecting");
     connectWiFi();
   }
 
@@ -499,7 +503,7 @@ void loop() {
     bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      if (readingIndex % 50 == 0 || anomalyNow) {
+      if (readingIndex % 100 == 0 || anomalyNow) {
         Serial.print("Published reading ");
         Serial.print(readingIndex);
 
@@ -518,10 +522,17 @@ void loop() {
         Serial.print(" | Zg=");
         Serial.println(z_g, 3);
       }
-
-      readingIndex++;
     } else {
-      Serial.println("MQTT publish FAILED");
+      Serial.print("MQTT publish FAILED | WiFi.status=");
+      Serial.print(WiFi.status());
+      Serial.print(" | mqtt.connected=");
+      Serial.print(mqttClient.connected() ? "true" : "false");
+      Serial.print(" | mqtt.state=");
+      Serial.print(mqttClient.state());
+      Serial.print(" | heap=");
+      Serial.println(ESP.getFreeHeap());
     }
+
+    readingIndex++;
   }
 }
