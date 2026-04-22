@@ -118,7 +118,7 @@ PubSubClient mqttClient(espClient);
 // ======================================================
 // 1000 ms for testing, easier to observe in Serial + MQTT
 // change back to 10 for 100 Hz later
-const unsigned long publishIntervalMs = 1000;
+const unsigned long publishIntervalMs = 10;
 
 // Read temperature asynchronously
 const unsigned long tempConversionWaitMs = 800;
