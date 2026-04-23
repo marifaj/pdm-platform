@@ -48,20 +48,29 @@ const char* machineId = "machine-001";
 const char* deviceId = "esp32-002";
 
 // ======================================================
-// TEST / SIMULATION CONFIG
-// ======================================================
-bool SIMULATE_SENSORS = true;   // true = no physical sensors needed
-bool FORCE_ANOMALY = false;     // false for initial testing
-
-// ======================================================
 // ANOMALY SIMULATION CONFIG
 // ======================================================
+// 100 Hz publishing -> 100 readings/second
+// 2 hours total     -> 720000 readings
+//
+// Planned schedule:
+//  0 - 20 min   : normal
+// 20 - 35 min   : temperature-only anomaly
+// 35 - 45 min   : recovery
+// 45 - 60 min   : vibration-only anomaly
+// 60 - 70 min   : recovery
+// 70 - 85 min   : both temp + vibration anomaly
+// 85 - 105 min  : recovery
+// 105 - 120 min : final normal
+
 enum AnomalyMode {
   ANOM_NONE = 0,
   ANOM_TEMP_ONLY = 1,
   ANOM_VIB_ONLY = 2,
   ANOM_BOTH = 3
 };
+
+bool FORCE_ANOMALY = true;
 
 struct AnomalySegment {
   uint32_t startIndex;
@@ -70,9 +79,9 @@ struct AnomalySegment {
 };
 
 const AnomalySegment ANOMALY_SCHEDULE[] = {
-  {30001, 18000, ANOM_TEMP_ONLY},
-  {66001, 18000, ANOM_VIB_ONLY},
-  {102001, 18000, ANOM_BOTH}
+ {30001, 18000, ANOM_TEMP_ONLY},   // 05:00–08:00
+  {66001, 18000, ANOM_VIB_ONLY},    // 11:00–14:00
+  {102001, 18000, ANOM_BOTH}        // 17:00–20:00
 };
 
 const size_t ANOMALY_SCHEDULE_COUNT =
@@ -83,10 +92,6 @@ const float FORCED_TEMP_C = 38.0f;
 const float FORCED_X_G = 0.90f;
 const float FORCED_Y_G = 0.85f;
 const float FORCED_Z_G = 0.20f;
-
-// Simulated baseline values
-const float SIM_TEMP_BASE_C = 24.5f;
-const float SIM_Z_BASE_G = 1.00f;
 
 // ======================================================
 // DS18B20
@@ -116,12 +121,11 @@ PubSubClient mqttClient(espClient);
 // ======================================================
 // TIMING
 // ======================================================
-// 1000 ms for testing, easier to observe in Serial + MQTT
-// change back to 10 for 100 Hz later
+// Publish accelerometer + latest temperature at 100 Hz
 const unsigned long publishIntervalMs = 10;
 
 // Read temperature asynchronously
-const unsigned long tempConversionWaitMs = 800;
+const unsigned long tempConversionWaitMs = 800; // safe for 12-bit DS18B20
 
 unsigned long lastPublishTime = 0;
 unsigned long lastTempRequestTime = 0;
@@ -138,11 +142,16 @@ float latestTempC = NAN;
 // ======================================================
 const char* anomalyModeToString(AnomalyMode mode) {
   switch (mode) {
-    case ANOM_NONE: return "none";
-    case ANOM_TEMP_ONLY: return "temp_only";
-    case ANOM_VIB_ONLY: return "vib_only";
-    case ANOM_BOTH: return "both";
-    default: return "unknown";
+    case ANOM_NONE:
+      return "none";
+    case ANOM_TEMP_ONLY:
+      return "temp_only";
+    case ANOM_VIB_ONLY:
+      return "vib_only";
+    case ANOM_BOTH:
+      return "both";
+    default:
+      return "unknown";
   }
 }
 
@@ -294,9 +303,16 @@ bool setupADXL345() {
     return false;
   }
 
+  // Standby before configuration
   if (!writeRegister(ADXL345_POWER_CTL, 0x00)) return false;
+
+  // Full resolution, +/-2g
   if (!writeRegister(ADXL345_DATA_FORMAT, 0x08)) return false;
+
+  // 100 Hz output data rate
   if (!writeRegister(ADXL345_BW_RATE, 0x0A)) return false;
+
+  // Measurement mode
   if (!writeRegister(ADXL345_POWER_CTL, 0x08)) return false;
 
   delay(100);
@@ -317,27 +333,13 @@ bool readADXL345(int16_t &x, int16_t &y, int16_t &z) {
   return true;
 }
 
-bool readSimulatedADXL345(int16_t &x, int16_t &y, int16_t &z) {
-  float idx = (float)readingIndex;
-
-  float x_g = 0.015f * sinf(idx * 0.07f);
-  float y_g = 0.012f * cosf(idx * 0.05f);
-  float z_g = SIM_Z_BASE_G + 0.008f * sinf(idx * 0.03f);
-
-  x = (int16_t)lroundf(x_g / ADXL345_SCALE_G_PER_LSB);
-  y = (int16_t)lroundf(y_g / ADXL345_SCALE_G_PER_LSB);
-  z = (int16_t)lroundf(z_g / ADXL345_SCALE_G_PER_LSB);
-
-  return true;
-}
-
 // ======================================================
 // DS18B20 HELPERS
 // ======================================================
 void setupDS18B20() {
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
   tempSensors.begin();
-  tempSensors.setWaitForConversion(false);
+  tempSensors.setWaitForConversion(false);  // non-blocking
 
   int deviceCount = tempSensors.getDeviceCount();
   Serial.print("DS18B20 device count = ");
@@ -353,12 +355,6 @@ void setupDS18B20() {
 }
 
 void updateTemperatureAsync() {
-  if (SIMULATE_SENSORS) {
-    float idx = (float)readingIndex;
-    latestTempC = SIM_TEMP_BASE_C + 0.25f * sinf(idx * 0.04f);
-    return;
-  }
-
   unsigned long now = millis();
 
   if (tempConversionInProgress) {
@@ -390,33 +386,31 @@ void setup() {
   Serial.println();
   Serial.println("Starting system...");
 
-  if (SIMULATE_SENSORS) {
-    Serial.println("SIMULATION MODE: skipping physical sensor initialization");
-    latestTempC = SIM_TEMP_BASE_C;
+  // Sensors
+  setupDS18B20();
+
+  Wire.begin(21, 22);
+  delay(200);
+
+  if (!setupADXL345()) {
+    Serial.println("FATAL: ADXL345 setup failed");
   } else {
-    setupDS18B20();
-
-    Wire.begin(21, 22);
-    delay(200);
-
-    if (!setupADXL345()) {
-      Serial.println("FATAL: ADXL345 setup failed");
-    } else {
-      Serial.println("ADXL345 initialized successfully");
-    }
+    Serial.println("ADXL345 initialized successfully");
   }
 
+  // Network and services
   connectWiFi();
   setupOTA();
   setupMQTT();
 
   Serial.println("System ready");
   Serial.println("------------------------------------");
-  Serial.print("SIMULATE_SENSORS = ");
-  Serial.println(SIMULATE_SENSORS ? "true" : "false");
   Serial.print("FORCE_ANOMALY = ");
   Serial.println(FORCE_ANOMALY ? "true" : "false");
   printAnomalySchedule();
+  if (!FORCE_ANOMALY) {
+    Serial.println("Manual anomaly mode: use physical disturbances only");
+  }
   Serial.println("------------------------------------");
 }
 
@@ -436,24 +430,22 @@ void loop() {
   }
   mqttClient.loop();
 
+  // Update temperature asynchronously
   updateTemperatureAsync();
 
+  // Publish accelerometer + latest temperature at 100 Hz
   unsigned long now = millis();
   if (now - lastPublishTime >= publishIntervalMs) {
     lastPublishTime = now;
 
     int16_t x = 0, y = 0, z = 0;
-
-    if (SIMULATE_SENSORS) {
-      readSimulatedADXL345(x, y, z);
-    } else {
-      if (!readADXL345(x, y, z)) {
-        Serial.println("ERROR: Failed to read ADXL345 data");
-        return;
-      }
+    if (!readADXL345(x, y, z)) {
+      Serial.println("ERROR: Failed to read ADXL345 data");
+      return;
     }
 
-    if (!SIMULATE_SENSORS && (isnan(latestTempC) || latestTempC == DEVICE_DISCONNECTED_C)) {
+    // Do not publish until temperature is valid
+    if (isnan(latestTempC) || latestTempC == DEVICE_DISCONNECTED_C) {
       return;
     }
 
@@ -511,18 +503,25 @@ void loop() {
     bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      Serial.print("Published reading ");
-      Serial.print(readingIndex);
-      Serial.print(" | TempC=");
-      Serial.print(tempToSend, 2);
-      Serial.print(" | Xg=");
-      Serial.print(x_g, 3);
-      Serial.print(" | Yg=");
-      Serial.print(y_g, 3);
-      Serial.print(" | Zg=");
-      Serial.print(z_g, 3);
-      Serial.print(" | Mode=");
-      Serial.println(anomalyNow ? anomalyModeToString(modeNow) : "normal");
+      if (readingIndex % 100 == 0 || anomalyNow) {
+        Serial.print("Published reading ");
+        Serial.print(readingIndex);
+
+        if (anomalyNow) {
+          Serial.print(" [ANOMALY:");
+          Serial.print(anomalyModeToString(modeNow));
+          Serial.print("]");
+        }
+
+        Serial.print(" | TempC=");
+        Serial.print(tempToSend, 2);
+        Serial.print(" | Xg=");
+        Serial.print(x_g, 3);
+        Serial.print(" | Yg=");
+        Serial.print(y_g, 3);
+        Serial.print(" | Zg=");
+        Serial.println(z_g, 3);
+      }
     } else {
       Serial.print("MQTT publish FAILED | WiFi.status=");
       Serial.print(WiFi.status());
