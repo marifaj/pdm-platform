@@ -17,7 +17,7 @@
 // ADXL345
 // VCC -> 3.3V
 // GND -> GND
-// SDA (green) -> GPIO21
+// SDA (green)  -> GPIO21
 // SCL (yellow) -> GPIO22
 // CS  -> 3.3V
 // SDO -> GND
@@ -25,6 +25,20 @@
 // IMPORTANT:
 // - ADXL345 is configured for FULL_RES + +/-2g
 // - scale factor = 3.9 mg/LSB = 0.0039 g/LSB
+// - PubSubClient publishes with MQTT QoS 0. Reliability is evaluated
+//   through readingIndex sequence gaps and publish-failure counters.
+
+// ======================================================
+// EXPERIMENT CONFIG - CHANGE ONLY THESE FOR EACH RUN
+// ======================================================
+const char* runId = "S5_multi_device_50hz_normal_esp32_001";
+
+// Use 50 for the first two-device normal run, then 100 for stress run.
+const int TARGET_HZ = 50;
+
+// Keep false for the planned experiments on device 001.
+// In the two-device anomaly run, device 001 stays normal while device 002 runs anomalies.
+bool FORCE_ANOMALY = false;
 
 // ======================================================
 // WIFI CONFIG
@@ -50,18 +64,20 @@ const char* deviceId = "esp32-001";
 // ======================================================
 // ANOMALY SIMULATION CONFIG
 // ======================================================
-// 100 Hz publishing -> 100 readings/second
-// 2 hours total     -> 720000 readings
+// The schedule is time-based through TARGET_HZ, so it keeps the same
+// minutes/seconds whether you run at 50 Hz or 100 Hz.
 //
-// Planned schedule:
-//  0 - 20 min   : normal
-// 20 - 35 min   : temperature-only anomaly
-// 35 - 45 min   : recovery
-// 45 - 60 min   : vibration-only anomaly
-// 60 - 70 min   : recovery
-// 70 - 85 min   : both temp + vibration anomaly
-// 85 - 105 min  : recovery
-// 105 - 120 min : final normal
+// Planned short journal experiment schedule:
+// 00:00-05:00 normal
+// 05:00-08:00 temperature-only anomaly
+// 08:00-11:00 recovery
+// 11:00-14:00 vibration-only anomaly
+// 14:00-17:00 recovery
+// 17:00-20:00 temperature + vibration anomaly
+// 20:00+      recovery/final normal
+
+#define SEC_TO_INDEX(sec) ((uint32_t)((sec) * TARGET_HZ) + 1UL)
+#define SEC_TO_COUNT(sec) ((uint32_t)((sec) * TARGET_HZ))
 
 enum AnomalyMode {
   ANOM_NONE = 0,
@@ -70,8 +86,6 @@ enum AnomalyMode {
   ANOM_BOTH = 3
 };
 
-bool FORCE_ANOMALY = false;
-
 struct AnomalySegment {
   uint32_t startIndex;
   uint32_t count;
@@ -79,9 +93,9 @@ struct AnomalySegment {
 };
 
 const AnomalySegment ANOMALY_SCHEDULE[] = {
- {30001, 18000, ANOM_TEMP_ONLY},   // 05:00–08:00
-  {66001, 18000, ANOM_VIB_ONLY},    // 11:00–14:00
-  {102001, 18000, ANOM_BOTH}        // 17:00–20:00
+  {SEC_TO_INDEX(300),  SEC_TO_COUNT(180), ANOM_TEMP_ONLY}, // 05:00-08:00
+  {SEC_TO_INDEX(660),  SEC_TO_COUNT(180), ANOM_VIB_ONLY},  // 11:00-14:00
+  {SEC_TO_INDEX(1020), SEC_TO_COUNT(180), ANOM_BOTH}       // 17:00-20:00
 };
 
 const size_t ANOMALY_SCHEDULE_COUNT =
@@ -121,37 +135,37 @@ PubSubClient mqttClient(espClient);
 // ======================================================
 // TIMING
 // ======================================================
-// Publish accelerometer + latest temperature at 100 Hz
-const unsigned long publishIntervalMs = 10;
-
-// Read temperature asynchronously
+const unsigned long publishIntervalMs = 1000UL / TARGET_HZ;
 const unsigned long tempConversionWaitMs = 800; // safe for 12-bit DS18B20
+const unsigned long statusPrintIntervalMs = 10000; // one status line every 10s
 
 unsigned long lastPublishTime = 0;
 unsigned long lastTempRequestTime = 0;
+unsigned long lastStatusPrintTime = 0;
 bool tempConversionInProgress = false;
 
 // ======================================================
-// STATE
+// STATE / COUNTERS
 // ======================================================
 uint32_t readingIndex = 1;
 float latestTempC = NAN;
+
+uint32_t mqttPublishOk = 0;
+uint32_t mqttPublishFailed = 0;
+uint32_t wifiReconnectCount = 0;
+uint32_t mqttReconnectAttemptCount = 0;
+uint32_t mqttReconnectSuccessCount = 0;
 
 // ======================================================
 // HELPERS
 // ======================================================
 const char* anomalyModeToString(AnomalyMode mode) {
   switch (mode) {
-    case ANOM_NONE:
-      return "none";
-    case ANOM_TEMP_ONLY:
-      return "temp_only";
-    case ANOM_VIB_ONLY:
-      return "vib_only";
-    case ANOM_BOTH:
-      return "both";
-    default:
-      return "unknown";
+    case ANOM_NONE:      return "none";
+    case ANOM_TEMP_ONLY: return "temp_only";
+    case ANOM_VIB_ONLY:  return "vib_only";
+    case ANOM_BOTH:      return "both";
+    default:             return "unknown";
   }
 }
 
@@ -170,6 +184,14 @@ AnomalyMode scheduledAnomalyMode(uint32_t idx) {
   return ANOM_NONE;
 }
 
+uint8_t adxlBwRateForTargetHz() {
+  // ADXL345 BW_RATE codes: 0x09 = 50 Hz, 0x0A = 100 Hz, 0x0B = 200 Hz.
+  // For target rates above 100, use at least 200 Hz output data rate.
+  if (TARGET_HZ <= 50) return 0x09;
+  if (TARGET_HZ <= 100) return 0x0A;
+  return 0x0B;
+}
+
 void printAnomalySchedule() {
   Serial.println("Anomaly schedule:");
   for (size_t i = 0; i < ANOMALY_SCHEDULE_COUNT; i++) {
@@ -180,17 +202,40 @@ void printAnomalySchedule() {
     Serial.print(i + 1);
     Serial.print(": ");
     Serial.print(anomalyModeToString(ANOMALY_SCHEDULE[i].mode));
-    Serial.print(" | start=");
+    Serial.print(" | startIndex=");
     Serial.print(startIdx);
-    Serial.print(" | end=");
+    Serial.print(" | endIndex=");
     Serial.print(endIdx);
     Serial.print(" | count=");
     Serial.println(ANOMALY_SCHEDULE[i].count);
   }
 }
 
+void printRunConfig() {
+  Serial.println("------------------------------------");
+  Serial.println("RUN CONFIG");
+  Serial.print("runId = ");
+  Serial.println(runId);
+  Serial.print("deviceId = ");
+  Serial.println(deviceId);
+  Serial.print("mqttClientId = ");
+  Serial.println(mqttClientId);
+  Serial.print("mqttTopic = ");
+  Serial.println(mqttTopic);
+  Serial.print("TARGET_HZ = ");
+  Serial.println(TARGET_HZ);
+  Serial.print("publishIntervalMs = ");
+  Serial.println(publishIntervalMs);
+  Serial.print("FORCE_ANOMALY = ");
+  Serial.println(FORCE_ANOMALY ? "true" : "false");
+  printAnomalySchedule();
+  Serial.println("------------------------------------");
+}
+
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
@@ -205,7 +250,7 @@ void connectWiFi() {
 }
 
 void setupOTA() {
-  ArduinoOTA.setHostname("esp32-temp-vibration");
+  ArduinoOTA.setHostname("esp32-temp-vibration-001");
 
   ArduinoOTA.onStart([]() {
     Serial.println("OTA update started");
@@ -225,14 +270,18 @@ void setupOTA() {
 
 void setupMQTT() {
   mqttClient.setServer(mqttServer, mqttPort);
-  mqttClient.setBufferSize(512);
+  mqttClient.setBufferSize(768);
+  mqttClient.setKeepAlive(20);
+  mqttClient.setSocketTimeout(3);
 }
 
 void reconnectMQTT() {
   while (!mqttClient.connected()) {
+    mqttReconnectAttemptCount++;
     Serial.print("Connecting to MQTT... ");
 
     if (mqttClient.connect(mqttClientId)) {
+      mqttReconnectSuccessCount++;
       Serial.println("connected");
     } else {
       Serial.print("failed, rc=");
@@ -241,6 +290,25 @@ void reconnectMQTT() {
       delay(2000);
     }
   }
+}
+
+void printStatusLine() {
+  Serial.print("STATUS | runId=");
+  Serial.print(runId);
+  Serial.print(" | deviceId=");
+  Serial.print(deviceId);
+  Serial.print(" | readingIndex=");
+  Serial.print(readingIndex);
+  Serial.print(" | ok=");
+  Serial.print(mqttPublishOk);
+  Serial.print(" | failed=");
+  Serial.print(mqttPublishFailed);
+  Serial.print(" | WiFiRSSI=");
+  Serial.print(WiFi.RSSI());
+  Serial.print(" | freeHeap=");
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(" | mqttState=");
+  Serial.println(mqttClient.state());
 }
 
 // ======================================================
@@ -309,8 +377,11 @@ bool setupADXL345() {
   // Full resolution, +/-2g
   if (!writeRegister(ADXL345_DATA_FORMAT, 0x08)) return false;
 
-  // 100 Hz output data rate
-  if (!writeRegister(ADXL345_BW_RATE, 0x0A)) return false;
+  // Output data rate matched to target publish rate
+  uint8_t bwRate = adxlBwRateForTargetHz();
+  if (!writeRegister(ADXL345_BW_RATE, bwRate)) return false;
+  Serial.print("ADXL345 BW_RATE code = 0x");
+  Serial.println(bwRate, HEX);
 
   // Measurement mode
   if (!writeRegister(ADXL345_POWER_CTL, 0x08)) return false;
@@ -384,7 +455,9 @@ void setup() {
   delay(1000);
 
   Serial.println();
-  Serial.println("Starting system...");
+  Serial.println("Starting ESP32 temperature + vibration telemetry system...");
+
+  printRunConfig();
 
   // Sensors
   setupDS18B20();
@@ -405,13 +478,6 @@ void setup() {
 
   Serial.println("System ready");
   Serial.println("------------------------------------");
-  Serial.print("FORCE_ANOMALY = ");
-  Serial.println(FORCE_ANOMALY ? "true" : "false");
-  printAnomalySchedule();
-  if (!FORCE_ANOMALY) {
-    Serial.println("Manual anomaly mode: use physical disturbances only");
-  }
-  Serial.println("------------------------------------");
 }
 
 // ======================================================
@@ -421,6 +487,7 @@ void loop() {
   ArduinoOTA.handle();
 
   if (WiFi.status() != WL_CONNECTED) {
+    wifiReconnectCount++;
     Serial.println("WiFi disconnected -> reconnecting");
     connectWiFi();
   }
@@ -430,11 +497,14 @@ void loop() {
   }
   mqttClient.loop();
 
-  // Update temperature asynchronously
   updateTemperatureAsync();
 
-  // Publish accelerometer + latest temperature at 100 Hz
   unsigned long now = millis();
+  if (now - lastStatusPrintTime >= statusPrintIntervalMs) {
+    lastStatusPrintTime = now;
+    printStatusLine();
+  }
+
   if (now - lastPublishTime >= publishIntervalMs) {
     lastPublishTime = now;
 
@@ -476,16 +546,22 @@ void loop() {
         rawZToSend = (int16_t)lroundf(FORCED_Z_G / ADXL345_SCALE_G_PER_LSB);
       }
 
-      Serial.print(">>> FORCED ANOMALY ACTIVE: ");
-      Serial.print(anomalyModeToString(modeNow));
-      Serial.println(" <<<");
+      // Avoid printing every anomaly message because it can disturb 50/100 Hz publishing.
+      if (readingIndex % (TARGET_HZ * 5) == 0) {
+        Serial.print(">>> FORCED ANOMALY ACTIVE: ");
+        Serial.print(anomalyModeToString(modeNow));
+        Serial.println(" <<<");
+      }
     }
 
-    char payload[384];
+    char payload[768];
     snprintf(
       payload,
       sizeof(payload),
-      "{\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f,\"mode\":\"%s\"}",
+      "{\"runId\":\"%s\",\"targetHz\":%d,\"espMillis\":%lu,\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f,\"mode\":\"%s\"}",
+      runId,
+      TARGET_HZ,
+      (unsigned long)millis(),
       factoryId,
       machineId,
       deviceId,
@@ -503,16 +579,14 @@ void loop() {
     bool published = mqttClient.publish(mqttTopic, payload, false);
 
     if (published) {
-      if (readingIndex % 100 == 0 || anomalyNow) {
+      mqttPublishOk++;
+
+      // Print only once every 10 seconds during normal operation.
+      if (readingIndex % (TARGET_HZ * 10) == 0) {
         Serial.print("Published reading ");
         Serial.print(readingIndex);
-
-        if (anomalyNow) {
-          Serial.print(" [ANOMALY:");
-          Serial.print(anomalyModeToString(modeNow));
-          Serial.print("]");
-        }
-
+        Serial.print(" | mode=");
+        Serial.print(anomalyNow ? anomalyModeToString(modeNow) : "normal");
         Serial.print(" | TempC=");
         Serial.print(tempToSend, 2);
         Serial.print(" | Xg=");
@@ -523,7 +597,10 @@ void loop() {
         Serial.println(z_g, 3);
       }
     } else {
-      Serial.print("MQTT publish FAILED | WiFi.status=");
+      mqttPublishFailed++;
+      Serial.print("MQTT publish FAILED | readingIndex=");
+      Serial.print(readingIndex);
+      Serial.print(" | WiFi.status=");
       Serial.print(WiFi.status());
       Serial.print(" | mqtt.connected=");
       Serial.print(mqttClient.connected() ? "true" : "false");
