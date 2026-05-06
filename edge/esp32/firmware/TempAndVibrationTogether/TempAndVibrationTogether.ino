@@ -70,7 +70,7 @@ enum AnomalyMode {
   ANOM_BOTH = 3
 };
 
-bool FORCE_ANOMALY = true;
+bool FORCE_ANOMALY = false;
 
 struct AnomalySegment {
   uint32_t startIndex;

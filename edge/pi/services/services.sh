@@ -59,7 +59,7 @@ start_one() {
   fi
 
   echo "▶️  starting $service ..."
-  nohup "$VENV_DIR/bin/python" "$entry" >> "$log" 2>&1 &
+  nohup "$VENV_DIR/bin/python" "$entry" >/dev/null 2>&1 &
   echo $! > "$pid"
   sleep 0.5
 
