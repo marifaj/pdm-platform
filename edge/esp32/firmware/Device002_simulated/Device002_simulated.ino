@@ -1,44 +1,41 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <Wire.h>
 #include <PubSubClient.h>
 #include <math.h>
 
 // ======================================================
-// SENSOR / WIRING NOTES
+// DEVICE 2 - SIMULATED TELEMETRY NODE
 // ======================================================
-// DS18B20
-// red    -> 3.3V
-// black  -> GND
-// yellow -> GPIO4
+// Purpose:
+// - Use this on ESP32-002 when the second DS18B20/ADXL345 hardware
+//   is not available or not reliable.
+// - It publishes synthetic temperature + vibration telemetry at the
+//   same nominal rate as a real node.
+// - This is suitable for IoT workload/scalability testing: throughput,
+//   MQTT reliability, latency, and Raspberry Pi 4 resource usage.
 //
-// ADXL345
-// VCC -> 3.3V
-// GND -> GND
-// SDA (green)  -> GPIO21
-// SCL (yellow) -> GPIO22
-// CS  -> 3.3V
-// SDO -> GND
+// Important paper wording:
+// - Describe this as an "emulated/synthetic ESP32 telemetry node", not
+//   as a second physical sensor node.
 //
-// IMPORTANT:
-// - ADXL345 is configured for FULL_RES + +/-2g
-// - scale factor = 3.9 mg/LSB = 0.0039 g/LSB
+// MQTT note:
 // - PubSubClient publishes with MQTT QoS 0. Reliability is evaluated
 //   through readingIndex sequence gaps and publish-failure counters.
 
 // ======================================================
 // EXPERIMENT CONFIG - CHANGE ONLY THESE FOR EACH RUN
 // ======================================================
-const char* runId = "S6_multi_device_100hz_normal_esp32_001";
+const char* runId = "S6_multi_device_100hz_normal_esp32_002_sim";
 
-// Use 50 for the first two-device normal run, then 100 for stress run.
+// Use 50 for S5, then 100 for S6 if stable.
 const int TARGET_HZ = 100;
 
-// Keep false for the planned experiments on device 001.
-// In the two-device anomaly run, device 001 stays normal while device 002 runs anomalies.
+// Keep false for normal runs. Set true only for the anomaly run on device 002.
 bool FORCE_ANOMALY = false;
+
+// Identifies the source as simulated in SQL/logs.
+const char* dataSource = "simulated";
+const char* sensorMode = "synthetic";
 
 // ======================================================
 // WIFI CONFIG
@@ -52,14 +49,35 @@ const char* password = "rinesanart";
 const char* mqttServer = "192.168.178.142";   // Pi4 IP
 const int mqttPort = 1883;
 const char* mqttTopic = "factory/factory-001/machine/machine-001/telemetry";
-const char* mqttClientId = "esp32-001";
+const char* mqttClientId = "esp32-002";
 
 // ======================================================
 // IDs
 // ======================================================
 const char* factoryId = "factory-001";
 const char* machineId = "machine-001";
-const char* deviceId = "esp32-001";
+const char* deviceId = "esp32-002";
+
+// ======================================================
+// SIMULATED NORMAL SIGNAL CONFIG
+// ======================================================
+// These values roughly mimic a quiet motor/accelerometer stream. Adjust only
+// if you want the synthetic stream to look closer to your real device-001 data.
+const float NORMAL_TEMP_BASE_C = 23.50f;
+const float NORMAL_X_BASE_G = -0.043f;
+const float NORMAL_Y_BASE_G = -0.008f;
+const float NORMAL_Z_BASE_G = -1.057f;
+
+// Small random noise amplitudes.
+const float TEMP_NOISE_C = 0.08f;   // +/- 0.08 C
+const float VIB_NOISE_G = 0.010f;   // +/- 0.010 g
+
+// Slow temperature drift amplitude for more natural synthetic data.
+const float TEMP_DRIFT_C = 0.20f;
+const float TEMP_DRIFT_PERIOD_MS = 180000.0f; // 3 minutes
+
+// ADXL345-compatible raw conversion assumption for payload consistency.
+const float ADXL345_SCALE_G_PER_LSB = 0.0039f;
 
 // ======================================================
 // ANOMALY SIMULATION CONFIG
@@ -67,7 +85,6 @@ const char* deviceId = "esp32-001";
 // The schedule is time-based through TARGET_HZ, so it keeps the same
 // minutes/seconds whether you run at 50 Hz or 100 Hz.
 //
-// Planned short journal experiment schedule:
 // 00:00-05:00 normal
 // 05:00-08:00 temperature-only anomaly
 // 08:00-11:00 recovery
@@ -101,30 +118,11 @@ const AnomalySegment ANOMALY_SCHEDULE[] = {
 const size_t ANOMALY_SCHEDULE_COUNT =
   sizeof(ANOMALY_SCHEDULE) / sizeof(ANOMALY_SCHEDULE[0]);
 
-// Forced anomaly values
+// Forced anomaly values. These match the previous controlled-anomaly design.
 const float FORCED_TEMP_C = 38.0f;
 const float FORCED_X_G = 0.90f;
 const float FORCED_Y_G = 0.85f;
 const float FORCED_Z_G = 0.20f;
-
-// ======================================================
-// DS18B20
-// ======================================================
-#define ONE_WIRE_BUS 4
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature tempSensors(&oneWire);
-
-// ======================================================
-// ADXL345
-// ======================================================
-#define ADXL345_ADDR 0x53
-#define ADXL345_DEVID_REG 0x00
-#define ADXL345_POWER_CTL 0x2D
-#define ADXL345_DATA_FORMAT 0x31
-#define ADXL345_BW_RATE 0x2C
-#define ADXL345_DATAX0 0x32
-
-const float ADXL345_SCALE_G_PER_LSB = 0.0039f; // full-res +/-2g
 
 // ======================================================
 // WIFI / MQTT OBJECTS
@@ -136,19 +134,15 @@ PubSubClient mqttClient(espClient);
 // TIMING
 // ======================================================
 const unsigned long publishIntervalMs = 1000UL / TARGET_HZ;
-const unsigned long tempConversionWaitMs = 800; // safe for 12-bit DS18B20
 const unsigned long statusPrintIntervalMs = 10000; // one status line every 10s
 
 unsigned long lastPublishTime = 0;
-unsigned long lastTempRequestTime = 0;
 unsigned long lastStatusPrintTime = 0;
-bool tempConversionInProgress = false;
 
 // ======================================================
 // STATE / COUNTERS
 // ======================================================
 uint32_t readingIndex = 1;
-float latestTempC = NAN;
 
 uint32_t mqttPublishOk = 0;
 uint32_t mqttPublishFailed = 0;
@@ -184,12 +178,31 @@ AnomalyMode scheduledAnomalyMode(uint32_t idx) {
   return ANOM_NONE;
 }
 
-uint8_t adxlBwRateForTargetHz() {
-  // ADXL345 BW_RATE codes: 0x09 = 50 Hz, 0x0A = 100 Hz, 0x0B = 200 Hz.
-  // For target rates above 100, use at least 200 Hz output data rate.
-  if (TARGET_HZ <= 50) return 0x09;
-  if (TARGET_HZ <= 100) return 0x0A;
-  return 0x0B;
+float randomFloat(float minValue, float maxValue) {
+  long r = random(0, 10001); // 0..10000
+  float ratio = ((float)r) / 10000.0f;
+  return minValue + (maxValue - minValue) * ratio;
+}
+
+float tempDrift(unsigned long nowMs) {
+  float angle = (2.0f * PI * ((float)(nowMs % (unsigned long)TEMP_DRIFT_PERIOD_MS))) / TEMP_DRIFT_PERIOD_MS;
+  return TEMP_DRIFT_C * sinf(angle);
+}
+
+void generateSyntheticNormal(float &tempC, float &xg, float &yg, float &zg) {
+  unsigned long nowMs = millis();
+
+  tempC = NORMAL_TEMP_BASE_C
+          + tempDrift(nowMs)
+          + randomFloat(-TEMP_NOISE_C, TEMP_NOISE_C);
+
+  xg = NORMAL_X_BASE_G + randomFloat(-VIB_NOISE_G, VIB_NOISE_G);
+  yg = NORMAL_Y_BASE_G + randomFloat(-VIB_NOISE_G, VIB_NOISE_G);
+  zg = NORMAL_Z_BASE_G + randomFloat(-VIB_NOISE_G, VIB_NOISE_G);
+}
+
+int16_t gToRaw(float g) {
+  return (int16_t)lroundf(g / ADXL345_SCALE_G_PER_LSB);
 }
 
 void printAnomalySchedule() {
@@ -213,11 +226,15 @@ void printAnomalySchedule() {
 
 void printRunConfig() {
   Serial.println("------------------------------------");
-  Serial.println("RUN CONFIG");
+  Serial.println("RUN CONFIG - SIMULATED DEVICE 2");
   Serial.print("runId = ");
   Serial.println(runId);
   Serial.print("deviceId = ");
   Serial.println(deviceId);
+  Serial.print("dataSource = ");
+  Serial.println(dataSource);
+  Serial.print("sensorMode = ");
+  Serial.println(sensorMode);
   Serial.print("mqttClientId = ");
   Serial.println(mqttClientId);
   Serial.print("mqttTopic = ");
@@ -250,7 +267,7 @@ void connectWiFi() {
 }
 
 void setupOTA() {
-  ArduinoOTA.setHostname("esp32-temp-vibration-001");
+  ArduinoOTA.setHostname("esp32-simulated-telemetry-002");
 
   ArduinoOTA.onStart([]() {
     Serial.println("OTA update started");
@@ -297,6 +314,8 @@ void printStatusLine() {
   Serial.print(runId);
   Serial.print(" | deviceId=");
   Serial.print(deviceId);
+  Serial.print(" | dataSource=");
+  Serial.print(dataSource);
   Serial.print(" | readingIndex=");
   Serial.print(readingIndex);
   Serial.print(" | ok=");
@@ -307,144 +326,14 @@ void printStatusLine() {
   Serial.print(WiFi.RSSI());
   Serial.print(" | freeHeap=");
   Serial.print(ESP.getFreeHeap());
+  Serial.print(" | wifiReconnects=");
+  Serial.print(wifiReconnectCount);
+  Serial.print(" | mqttReconnectAttempts=");
+  Serial.print(mqttReconnectAttemptCount);
+  Serial.print(" | mqttReconnectSuccess=");
+  Serial.print(mqttReconnectSuccessCount);
   Serial.print(" | mqttState=");
   Serial.println(mqttClient.state());
-}
-
-// ======================================================
-// ADXL345 LOW-LEVEL FUNCTIONS
-// ======================================================
-bool writeRegister(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(ADXL345_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  return (Wire.endTransmission() == 0);
-}
-
-bool readRegister(uint8_t reg, uint8_t &value) {
-  Wire.beginTransmission(ADXL345_ADDR);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-
-  uint8_t received = Wire.requestFrom((uint8_t)ADXL345_ADDR, (uint8_t)1);
-  if (received != 1) {
-    return false;
-  }
-
-  value = Wire.read();
-  return true;
-}
-
-bool readRegisters(uint8_t startReg, uint8_t count, uint8_t *data) {
-  Wire.beginTransmission(ADXL345_ADDR);
-  Wire.write(startReg);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-
-  uint8_t received = Wire.requestFrom((uint8_t)ADXL345_ADDR, count);
-  if (received != count) {
-    return false;
-  }
-
-  for (uint8_t i = 0; i < count; i++) {
-    data[i] = Wire.read();
-  }
-
-  return true;
-}
-
-bool setupADXL345() {
-  uint8_t devid = 0;
-  if (!readRegister(ADXL345_DEVID_REG, devid)) {
-    Serial.println("ERROR: Failed to read ADXL345 DEVID");
-    return false;
-  }
-
-  Serial.print("ADXL345 DEVID = 0x");
-  Serial.println(devid, HEX);
-
-  if (devid != 0xE5) {
-    Serial.println("ERROR: Unexpected ADXL345 device ID");
-    return false;
-  }
-
-  // Standby before configuration
-  if (!writeRegister(ADXL345_POWER_CTL, 0x00)) return false;
-
-  // Full resolution, +/-2g
-  if (!writeRegister(ADXL345_DATA_FORMAT, 0x08)) return false;
-
-  // Output data rate matched to target publish rate
-  uint8_t bwRate = adxlBwRateForTargetHz();
-  if (!writeRegister(ADXL345_BW_RATE, bwRate)) return false;
-  Serial.print("ADXL345 BW_RATE code = 0x");
-  Serial.println(bwRate, HEX);
-
-  // Measurement mode
-  if (!writeRegister(ADXL345_POWER_CTL, 0x08)) return false;
-
-  delay(100);
-  return true;
-}
-
-bool readADXL345(int16_t &x, int16_t &y, int16_t &z) {
-  uint8_t rawData[6] = {0};
-
-  if (!readRegisters(ADXL345_DATAX0, 6, rawData)) {
-    return false;
-  }
-
-  x = (int16_t)((rawData[1] << 8) | rawData[0]);
-  y = (int16_t)((rawData[3] << 8) | rawData[2]);
-  z = (int16_t)((rawData[5] << 8) | rawData[4]);
-
-  return true;
-}
-
-// ======================================================
-// DS18B20 HELPERS
-// ======================================================
-void setupDS18B20() {
-  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
-  tempSensors.begin();
-  tempSensors.setWaitForConversion(false);  // non-blocking
-
-  int deviceCount = tempSensors.getDeviceCount();
-  Serial.print("DS18B20 device count = ");
-  Serial.println(deviceCount);
-
-  if (deviceCount == 0) {
-    Serial.println("WARNING: No DS18B20 detected");
-  }
-
-  tempSensors.requestTemperatures();
-  lastTempRequestTime = millis();
-  tempConversionInProgress = true;
-}
-
-void updateTemperatureAsync() {
-  unsigned long now = millis();
-
-  if (tempConversionInProgress) {
-    if (now - lastTempRequestTime >= tempConversionWaitMs) {
-      float t = tempSensors.getTempCByIndex(0);
-      if (t != DEVICE_DISCONNECTED_C) {
-        latestTempC = t;
-      } else {
-        Serial.println("WARNING: DS18B20 disconnected or invalid reading");
-      }
-
-      tempSensors.requestTemperatures();
-      lastTempRequestTime = now;
-    }
-  } else {
-    tempSensors.requestTemperatures();
-    lastTempRequestTime = now;
-    tempConversionInProgress = true;
-  }
 }
 
 // ======================================================
@@ -454,24 +343,13 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  randomSeed((uint32_t)esp_random());
+
   Serial.println();
-  Serial.println("Starting ESP32 temperature + vibration telemetry system...");
+  Serial.println("Starting ESP32 simulated temperature + vibration telemetry node...");
 
   printRunConfig();
 
-  // Sensors
-  setupDS18B20();
-
-  Wire.begin(21, 22);
-  delay(200);
-
-  if (!setupADXL345()) {
-    Serial.println("FATAL: ADXL345 setup failed");
-  } else {
-    Serial.println("ADXL345 initialized successfully");
-  }
-
-  // Network and services
   connectWiFi();
   setupOTA();
   setupMQTT();
@@ -497,9 +375,8 @@ void loop() {
   }
   mqttClient.loop();
 
-  updateTemperatureAsync();
-
   unsigned long now = millis();
+
   if (now - lastStatusPrintTime >= statusPrintIntervalMs) {
     lastStatusPrintTime = now;
     printStatusLine();
@@ -508,25 +385,12 @@ void loop() {
   if (now - lastPublishTime >= publishIntervalMs) {
     lastPublishTime = now;
 
-    int16_t x = 0, y = 0, z = 0;
-    if (!readADXL345(x, y, z)) {
-      Serial.println("ERROR: Failed to read ADXL345 data");
-      return;
-    }
+    float tempToSend = NAN;
+    float x_g = NAN;
+    float y_g = NAN;
+    float z_g = NAN;
 
-    // Do not publish until temperature is valid
-    if (isnan(latestTempC) || latestTempC == DEVICE_DISCONNECTED_C) {
-      return;
-    }
-
-    int16_t rawXToSend = x;
-    int16_t rawYToSend = y;
-    int16_t rawZToSend = z;
-
-    float x_g = x * ADXL345_SCALE_G_PER_LSB;
-    float y_g = y * ADXL345_SCALE_G_PER_LSB;
-    float z_g = z * ADXL345_SCALE_G_PER_LSB;
-    float tempToSend = latestTempC;
+    generateSyntheticNormal(tempToSend, x_g, y_g, z_g);
 
     AnomalyMode modeNow = scheduledAnomalyMode(readingIndex);
     bool anomalyNow = (modeNow != ANOM_NONE);
@@ -540,28 +404,30 @@ void loop() {
         x_g = FORCED_X_G;
         y_g = FORCED_Y_G;
         z_g = FORCED_Z_G;
-
-        rawXToSend = (int16_t)lroundf(FORCED_X_G / ADXL345_SCALE_G_PER_LSB);
-        rawYToSend = (int16_t)lroundf(FORCED_Y_G / ADXL345_SCALE_G_PER_LSB);
-        rawZToSend = (int16_t)lroundf(FORCED_Z_G / ADXL345_SCALE_G_PER_LSB);
       }
 
       // Avoid printing every anomaly message because it can disturb 50/100 Hz publishing.
       if (readingIndex % (TARGET_HZ * 5) == 0) {
-        Serial.print(">>> FORCED ANOMALY ACTIVE: ");
+        Serial.print(">>> SYNTHETIC ANOMALY ACTIVE: ");
         Serial.print(anomalyModeToString(modeNow));
         Serial.println(" <<<");
       }
     }
 
+    int16_t rawXToSend = gToRaw(x_g);
+    int16_t rawYToSend = gToRaw(y_g);
+    int16_t rawZToSend = gToRaw(z_g);
+
     char payload[768];
     snprintf(
       payload,
       sizeof(payload),
-      "{\"runId\":\"%s\",\"targetHz\":%d,\"espMillis\":%lu,\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f,\"mode\":\"%s\"}",
+      "{\"runId\":\"%s\",\"targetHz\":%d,\"espMillis\":%lu,\"dataSource\":\"%s\",\"sensorMode\":\"%s\",\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f,\"mode\":\"%s\"}",
       runId,
       TARGET_HZ,
-      (unsigned long)millis(),
+      (unsigned long)now,
+      dataSource,
+      sensorMode,
       factoryId,
       machineId,
       deviceId,
@@ -581,12 +447,14 @@ void loop() {
     if (published) {
       mqttPublishOk++;
 
-      // Print only once every 10 seconds during normal operation.
+      // Print only once every 10 seconds.
       if (readingIndex % (TARGET_HZ * 10) == 0) {
         Serial.print("Published reading ");
         Serial.print(readingIndex);
         Serial.print(" | mode=");
         Serial.print(anomalyNow ? anomalyModeToString(modeNow) : "normal");
+        Serial.print(" | source=");
+        Serial.print(dataSource);
         Serial.print(" | TempC=");
         Serial.print(tempToSend, 2);
         Serial.print(" | Xg=");
