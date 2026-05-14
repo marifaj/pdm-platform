@@ -66,7 +66,7 @@ const char* deviceId = "esp32-002";
 const float NORMAL_TEMP_BASE_C = 23.50f;
 const float NORMAL_X_BASE_G = -0.043f;
 const float NORMAL_Y_BASE_G = -0.008f;
-const float NORMAL_Z_BASE_G = -1.057f;
+const float NORMAL_Z_BASE_G = -1.077f;
 
 // Small random noise amplitudes.
 const float TEMP_NOISE_C = 0.08f;   // +/- 0.08 C

@@ -314,7 +314,8 @@ def make_feature_frame(feature_row: dict) -> pd.DataFrame:
 def run_ml_inference(X: pd.DataFrame):
     score = float(model.decision_function(X)[0])  # higher = more normal
     pred = int(model.predict(X)[0])               # 1 = normal, -1 = anomaly
-    is_anomaly_ml = 1 if pred == -1 else 0
+    ML_SCORE_THRESHOLD = float(os.getenv("ML_SCORE_THRESHOLD", "-0.01"))
+    is_anomaly_ml = 1 if score < ML_SCORE_THRESHOLD else 0
     return score, pred, is_anomaly_ml
 
 

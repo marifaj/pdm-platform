@@ -31,10 +31,10 @@
 // ======================================================
 // EXPERIMENT CONFIG - CHANGE ONLY THESE FOR EACH RUN
 // ======================================================
-const char* runId = "S5_multi_device_50hz_normal_esp32_002";
+const char* runId = "S6_multi_device_100hz_normal_esp32_002";
 
 // Use 50 for the first two-device normal run, then 100 for stress run.
-const int TARGET_HZ = 50;
+const int TARGET_HZ = 100;
 
 // Keep false for normal runs. Set true only for the anomaly run on device 002.
 bool FORCE_ANOMALY = false;
