@@ -493,9 +493,13 @@ def publish_inference_result(
     first = window_samples[0]
     last = window_samples[-1]
 
+    ts_ms = now_ms()
+    ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000))
+
     result = {
         "schema": "mva.inference.v1",
-        "ts_inference_ms": now_ms(),
+        "ts_inference": ts_iso,
+        "ts_inference_ms": ts_ms,
         "device_id": device_id,
         "machine_id": machine_id,
         "reading_index_start": first.get("reading_index"),
