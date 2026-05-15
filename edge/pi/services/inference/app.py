@@ -33,6 +33,10 @@ DETECTION_MODE = os.getenv("DETECTION_MODE", "hybrid").lower().strip()
 WINDOW_SIZE = int(os.getenv("INFERENCE_WINDOW_SIZE", "100"))
 WINDOW_STEP = int(os.getenv("INFERENCE_WINDOW_STEP", "50"))
 
+# Ignore early startup windows before this reading index.
+# At 100 Hz, 5000 readings ≈ 50 seconds.
+IGNORE_BEFORE_INDEX = int(os.getenv("INFERENCE_IGNORE_BEFORE_INDEX", "5000"))
+
 # ML model paths
 MODEL_DIR = Path(os.getenv("INFERENCE_MODEL_DIR", str(Path.home() / "mva/models")))
 
@@ -663,6 +667,29 @@ def on_message(client, userdata, msg):
         ewma_details,
         ml_details,
     )
+
+    # Startup warm-up suppression:
+    # Do not allow early windows to become final anomalies.
+    window_end_index = int(window_samples[-1].get("reading_index") or 0)
+
+    if window_end_index < IGNORE_BEFORE_INDEX:
+        if is_final_anomaly:
+            log(
+                "[WARMUP] Suppressed early anomaly "
+                f"device={device_id} "
+                f"win={window_samples[0]['reading_index']}-{window_samples[-1]['reading_index']} "
+                f"reason={reason} "
+                f"threshold={IGNORE_BEFORE_INDEX}"
+            )
+
+        is_final_anomaly = False
+        reason = "normal"
+        severity = "info"
+
+        # Also make the flat fields consistent for event_processing.
+        ml_details["ml_anomaly"] = False
+        ml_details["ml_prediction"] = 1
+        ewma_details["ewma_anomaly"] = False
 
     publish_inference_result(
         client=client,
