@@ -92,9 +92,9 @@ struct AnomalySegment {
 };
 
 const AnomalySegment ANOMALY_SCHEDULE[] = {
-  {SEC_TO_INDEX(60),  SEC_TO_COUNT(90), ANOM_TEMP_ONLY}, // 01:00-02:30
-  {SEC_TO_INDEX(240), SEC_TO_COUNT(90), ANOM_VIB_ONLY},  // 04:00-05:30
-  {SEC_TO_INDEX(420), SEC_TO_COUNT(90), ANOM_BOTH}       // 07:00-08:30
+  {SEC_TO_INDEX(60),  SEC_TO_COUNT(40), ANOM_TEMP_ONLY}, // 01:00-01:40
+  {SEC_TO_INDEX(180), SEC_TO_COUNT(40), ANOM_VIB_ONLY},  // 03:00-03:40
+  {SEC_TO_INDEX(300), SEC_TO_COUNT(40), ANOM_BOTH}       // 05:00-05:40
 };
 
 const size_t ANOMALY_SCHEDULE_COUNT =
@@ -102,9 +102,9 @@ const size_t ANOMALY_SCHEDULE_COUNT =
 
 // Forced anomaly values
 const float FORCED_TEMP_C = 38.0f;
-const float FORCED_X_G = 0.90f;
-const float FORCED_Y_G = 0.85f;
-const float FORCED_Z_G = 0.20f;
+const float FORCED_X_G = 1.40f;
+const float FORCED_Y_G = 1.10f;
+const float FORCED_Z_G = 0.30f;
 
 // ======================================================
 // DS18B20
