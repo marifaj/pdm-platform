@@ -26,6 +26,9 @@ MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "mva-inference-service")
 INPUT_TOPIC = os.getenv("INFERENCE_INPUT_TOPIC", "mva/normalized/telemetry")
 OUTPUT_TOPIC = os.getenv("INFERENCE_OUTPUT_TOPIC", "mva/inference/telemetry")
 
+LOG_PATH = os.path.expanduser(os.getenv("INFERENCE_LOG_PATH", "~/mva/logs/inference.log"))
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
 # Detection mode: ewma_only, ml_only, hybrid
 DETECTION_MODE = os.getenv("DETECTION_MODE", "hybrid").lower().strip()
 
@@ -34,7 +37,7 @@ WINDOW_SIZE = int(os.getenv("INFERENCE_WINDOW_SIZE", "100"))
 WINDOW_STEP = int(os.getenv("INFERENCE_WINDOW_STEP", "50"))
 
 # Ignore early startup windows before this reading index.
-# At 100 Hz, 5000 readings ≈ 50 seconds.
+# At 100 Hz, 5000 readings is approximately 50 seconds.
 IGNORE_BEFORE_INDEX = int(os.getenv("INFERENCE_IGNORE_BEFORE_INDEX", "5000"))
 
 # ML model paths
@@ -49,8 +52,12 @@ MODEL_DIR = Path(os.getenv("INFERENCE_MODEL_DIR", str(Path.home() / "mva/models"
 MODEL_FILE_TEMPLATE = os.getenv("INFERENCE_MODEL_TEMPLATE", "if_model_{device_id}.joblib")
 FALLBACK_MODEL_PATH = Path(os.getenv("INFERENCE_MODEL_PATH", str(MODEL_DIR / "if_model.joblib")))
 
+# Fallback is disabled by default so esp32-002 cannot silently use the old/shared model.
+# Enable only intentionally:
+# export INFERENCE_ALLOW_FALLBACK_MODEL=1
+ALLOW_FALLBACK_MODEL = os.getenv("INFERENCE_ALLOW_FALLBACK_MODEL", "0") == "1"
+
 # Optional explicit device model map:
-# Example:
 # export INFERENCE_DEVICE_MODELS='{"esp32-001":"/home/marifaj/mva/models/if_model_esp32_001.joblib","esp32-002":"/home/marifaj/mva/models/if_model_esp32_002.joblib"}'
 DEVICE_MODELS_JSON = os.getenv("INFERENCE_DEVICE_MODELS", "").strip()
 
@@ -61,8 +68,11 @@ EWMA_MIN_STD = float(os.getenv("EWMA_MIN_STD", "0.05"))
 EWMA_THRESHOLD = float(os.getenv("EWMA_THRESHOLD", "3.0"))
 
 # Logging
-LOG_EVERY_N_WINDOWS = int(os.getenv("INFERENCE_LOG_EVERY_N", "100"))
-LOG_NORMAL_WINDOWS = os.getenv("INFERENCE_LOG_NORMAL_WINDOWS", "0") == "1"
+# Debug defaults are intentionally verbose. After debugging, use:
+# export INFERENCE_LOG_NORMAL_WINDOWS=0
+# export INFERENCE_LOG_EVERY_N=100
+LOG_EVERY_N_WINDOWS = int(os.getenv("INFERENCE_LOG_EVERY_N", "1"))
+LOG_NORMAL_WINDOWS = os.getenv("INFERENCE_LOG_NORMAL_WINDOWS", "1") == "1"
 
 # MQTT QoS
 MQTT_QOS = int(os.getenv("MQTT_QOS", "0"))
@@ -104,6 +114,9 @@ fallback_model: Optional[Any] = None
 # EWMA state per device and signal
 ewma_state: Dict[str, Dict[str, Any]] = defaultdict(dict)
 
+# Avoid repeated missing-model spam.
+missing_model_warned = set()
+
 
 # ============================================================
 # Utility functions
@@ -118,7 +131,15 @@ def now_iso_utc() -> str:
 
 
 def log(message: str) -> None:
-    print(message, flush=True)
+    line = f"{now_iso_utc()} inference {message}"
+    print(line, flush=True)
+
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Logging should never crash inference.
+        pass
 
 
 def normalize_device_id_for_filename(device_id: str) -> str:
@@ -257,7 +278,7 @@ def build_features(window_samples: list) -> Tuple[pd.DataFrame, Dict[str, float]
     temp = np.array([s["temperature_c"] for s in window_samples], dtype=float)
     vib = np.array([s["vibration_mag_g"] for s in window_samples], dtype=float)
 
-    # Remove NaNs if any
+    # Remove NaNs if any.
     temp = temp[~np.isnan(temp)]
     vib = vib[~np.isnan(vib)]
 
@@ -291,6 +312,8 @@ def load_model_file(path: Path) -> Optional[Any]:
             model = joblib.load(path)
             log(f"[MODEL] Loaded: {path}")
             return model
+
+        log(f"[MODEL] Missing: {path}")
         return None
     except Exception as exc:
         log(f"[ERROR] Failed to load model {path}: {exc}")
@@ -302,9 +325,16 @@ def load_models() -> None:
 
     models = {}
 
+    log(f"[MODEL] MODEL_DIR={MODEL_DIR}")
+    log(f"[MODEL] MODEL_FILE_TEMPLATE={MODEL_FILE_TEMPLATE}")
+    log(f"[MODEL] FALLBACK_MODEL_PATH={FALLBACK_MODEL_PATH}")
+    log(f"[MODEL] ALLOW_FALLBACK_MODEL={ALLOW_FALLBACK_MODEL}")
+
     if DEVICE_MODELS_JSON:
         try:
             explicit_map = json.loads(DEVICE_MODELS_JSON)
+            log(f"[MODEL] Using explicit INFERENCE_DEVICE_MODELS map for {len(explicit_map)} device(s)")
+
             for device_id, model_path in explicit_map.items():
                 loaded = load_model_file(Path(model_path))
                 if loaded is not None:
@@ -326,11 +356,17 @@ def load_models() -> None:
         )
         path = MODEL_DIR / filename
 
+        log(f"[MODEL] Looking for device={device_id} model at {path}")
+
         loaded = load_model_file(path)
         if loaded is not None:
             models[device_id] = loaded
 
-    fallback_model = load_model_file(FALLBACK_MODEL_PATH)
+    if ALLOW_FALLBACK_MODEL:
+        fallback_model = load_model_file(FALLBACK_MODEL_PATH)
+    else:
+        fallback_model = None
+        log("[MODEL] Fallback disabled. Missing device-specific models will produce no-model decisions.")
 
     log("[MODEL] Device models loaded:")
     if models:
@@ -342,18 +378,25 @@ def load_models() -> None:
     if fallback_model is not None:
         log(f"[MODEL] Fallback model available: {FALLBACK_MODEL_PATH}")
     else:
-        log("[MODEL] No fallback model available")
+        log("[MODEL] No fallback model active")
 
 
-def get_model_for_device(device_id: str) -> Optional[Any]:
+def get_model_for_device(device_id: str) -> Tuple[Optional[Any], str]:
     if device_id in models:
-        return models[device_id]
+        return models[device_id], device_id
 
     normalized = device_id.replace("_", "-")
     if normalized in models:
-        return models[normalized]
+        return models[normalized], normalized
 
-    return fallback_model
+    if ALLOW_FALLBACK_MODEL and fallback_model is not None:
+        return fallback_model, "fallback"
+
+    if device_id not in missing_model_warned:
+        missing_model_warned.add(device_id)
+        log(f"[WARN] No device-specific model found for device={device_id}; fallback disabled")
+
+    return None, "none"
 
 
 # ============================================================
@@ -383,7 +426,7 @@ def ewma_update_signal(device_id: str, signal_name: str, value: float) -> Tuple[
 
     state["residuals"].append(residual)
 
-    # EWMA update
+    # EWMA update.
     state["mean"] = EWMA_ALPHA * value + (1.0 - EWMA_ALPHA) * prev_mean
 
     residuals = np.array(state["residuals"], dtype=float)
@@ -421,7 +464,7 @@ def ewma_detect(device_id: str, features: Dict[str, float]) -> Tuple[bool, Dict[
 # ============================================================
 
 def ml_detect(device_id: str, feature_df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
-    model = get_model_for_device(device_id)
+    model, model_used = get_model_for_device(device_id)
 
     if model is None:
         return False, {
@@ -430,7 +473,7 @@ def ml_detect(device_id: str, feature_df: pd.DataFrame) -> Tuple[bool, Dict[str,
             "ml_reason": "no_model_for_device",
             "ml_prediction": 1,
             "ml_score": 0.0,
-            "ml_model_device": "none",
+            "ml_model_device": model_used,
         }
 
     try:
@@ -447,11 +490,11 @@ def ml_detect(device_id: str, feature_df: pd.DataFrame) -> Tuple[bool, Dict[str,
             "ml_available": True,
             "ml_prediction": pred,
             "ml_score": score,
-            "ml_model_device": device_id if device_id in models else "fallback",
+            "ml_model_device": model_used,
         }
 
     except Exception as exc:
-        log(f"[ERROR] ML prediction failed for device={device_id}: {exc}")
+        log(f"[ERROR] ML prediction failed for device={device_id}, model_used={model_used}: {exc}")
         return False, {
             "ml_anomaly": False,
             "ml_available": False,
@@ -487,7 +530,7 @@ def make_final_decision(
             return True, "ml_only", "high"
         return False, "normal", "info"
 
-    # Default: hybrid
+    # Default: hybrid.
     if DETECTION_MODE == "hybrid":
         if ewma_anomaly and ml_anomaly:
             return True, "ml_and_ewma", "critical"
@@ -497,7 +540,7 @@ def make_final_decision(
             return True, "ewma_only", "medium"
         return False, "normal", "info"
 
-    # Unknown mode fallback
+    # Unknown mode fallback.
     log(f"[WARN] Unknown DETECTION_MODE={DETECTION_MODE}, using hybrid behavior")
 
     if ewma_anomaly and ml_anomaly:
@@ -558,7 +601,7 @@ def publish_inference_result(
     result = {
         "schema": "mva.inference.v1",
 
-        # Required by event_processing/app.py
+        # Required by event_processing/app.py.
         "ts_inference": ts_iso,
         "window_start_ts": window_start_ts,
         "window_end_ts": window_end_ts,
@@ -580,7 +623,7 @@ def publish_inference_result(
         "is_anomaly_final": int(is_anomaly_final),
         "anomaly_reason": anomaly_reason,
 
-        # Extra compatibility / debugging fields
+        # Extra compatibility / debugging fields.
         "ts_inference_ms": ts_ms,
         "reading_index_start": window_start_index,
         "reading_index_end": window_end_index,
@@ -590,14 +633,19 @@ def publish_inference_result(
         "reason": reason,
         "severity": severity,
 
-        # Flattened features for event DB columns
+        # Model debug fields.
+        "ml_model_device": ml_details.get("ml_model_device", "unknown"),
+        "ml_available": bool(ml_details.get("ml_available", False)),
+        "ml_reason": ml_details.get("ml_reason", ""),
+
+        # Flattened features for event DB columns.
         "temp_mean": float(feature_values.get("temp_mean", 0.0)),
         "temp_std": float(feature_values.get("temp_std", 0.0)),
         "vib_mean": float(feature_values.get("vib_mean", 0.0)),
         "vib_std": float(feature_values.get("vib_std", 0.0)),
         "vib_rms": float(feature_values.get("vib_mean", 0.0)),
 
-        # Nested details retained for debugging
+        # Nested details retained for debugging.
         "features": feature_values,
         "ewma": ewma_details,
         "ml": ml_details,
@@ -672,13 +720,23 @@ def on_message(client, userdata, msg):
     # Do not allow early windows to become final anomalies.
     window_end_index = int(window_samples[-1].get("reading_index") or 0)
 
+    suppressed_by_warmup = False
+    original_reason = reason
+    original_ml_anomaly = bool(ml_details.get("ml_anomaly", False))
+    original_ewma_anomaly = bool(ewma_details.get("ewma_anomaly", False))
+
     if window_end_index < IGNORE_BEFORE_INDEX:
         if is_final_anomaly:
+            suppressed_by_warmup = True
             log(
                 "[WARMUP] Suppressed early anomaly "
                 f"device={device_id} "
                 f"win={window_samples[0]['reading_index']}-{window_samples[-1]['reading_index']} "
                 f"reason={reason} "
+                f"ml={original_ml_anomaly} "
+                f"ewma={original_ewma_anomaly} "
+                f"model={ml_details.get('ml_model_device')} "
+                f"score={ml_details.get('ml_score')} "
                 f"threshold={IGNORE_BEFORE_INDEX}"
             )
 
@@ -709,6 +767,8 @@ def on_message(client, userdata, msg):
 
     if is_final_anomaly:
         should_log = True
+    elif suppressed_by_warmup:
+        should_log = True
     elif LOG_NORMAL_WINDOWS:
         should_log = True
     elif LOG_EVERY_N_WINDOWS > 0 and window_counter[device_id] % LOG_EVERY_N_WINDOWS == 0:
@@ -722,12 +782,23 @@ def on_message(client, userdata, msg):
             f"win={window_samples[0]['reading_index']}-{window_samples[-1]['reading_index']} "
             f"is_final={1 if is_final_anomaly else 0} "
             f"reason={reason} "
+            f"original_reason={original_reason} "
             f"severity={severity} "
             f"ml={ml_details.get('ml_anomaly')} "
+            f"ml_original={original_ml_anomaly} "
             f"ml_model={ml_details.get('ml_model_device')} "
+            f"ml_score={ml_details.get('ml_score')} "
+            f"ml_pred={ml_details.get('ml_prediction')} "
+            f"ml_available={ml_details.get('ml_available')} "
             f"ewma={ewma_details.get('ewma_anomaly')} "
+            f"ewma_original={original_ewma_anomaly} "
+            f"temp_z={ewma_details.get('ewma_temp_residual')} "
+            f"vib_z={ewma_details.get('ewma_vib_residual')} "
             f"temp_mean={feature_values['temp_mean']:.3f} "
-            f"vib_mean={feature_values['vib_mean']:.3f}"
+            f"temp_std={feature_values['temp_std']:.6f} "
+            f"vib_mean={feature_values['vib_mean']:.6f} "
+            f"vib_std={feature_values['vib_std']:.6f} "
+            f"warmup={suppressed_by_warmup}"
         )
 
 
@@ -754,10 +825,14 @@ def main():
     log(f"[CONFIG] MQTT_PORT={MQTT_PORT}")
     log(f"[CONFIG] INPUT_TOPIC={INPUT_TOPIC}")
     log(f"[CONFIG] OUTPUT_TOPIC={OUTPUT_TOPIC}")
+    log(f"[CONFIG] LOG_PATH={LOG_PATH}")
     log(f"[CONFIG] DETECTION_MODE={DETECTION_MODE}")
     log(f"[CONFIG] WINDOW_SIZE={WINDOW_SIZE}")
     log(f"[CONFIG] WINDOW_STEP={WINDOW_STEP}")
+    log(f"[CONFIG] IGNORE_BEFORE_INDEX={IGNORE_BEFORE_INDEX}")
     log(f"[CONFIG] MODEL_DIR={MODEL_DIR}")
+    log(f"[CONFIG] LOG_NORMAL_WINDOWS={LOG_NORMAL_WINDOWS}")
+    log(f"[CONFIG] LOG_EVERY_N_WINDOWS={LOG_EVERY_N_WINDOWS}")
 
     load_models()
 
