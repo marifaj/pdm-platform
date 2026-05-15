@@ -109,14 +109,18 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def now_iso_utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
 
 def normalize_device_id_for_filename(device_id: str) -> str:
     """
-    Converts esp32-001 -> esp32_001 for filenames if needed.
-    Your earlier suggested model names were:
+    Converts esp32-001 -> esp32_001 for filenames.
+    Expected model files:
       if_model_esp32_001.joblib
       if_model_esp32_002.joblib
     """
@@ -153,6 +157,15 @@ def parse_payload(raw_payload: bytes) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_factory_id(data: Dict[str, Any]) -> str:
+    return (
+        data.get("factory_id")
+        or data.get("factoryId")
+        or data.get("factory")
+        or "factory-001"
+    )
+
+
 def get_device_id(data: Dict[str, Any]) -> str:
     return (
         data.get("device_id")
@@ -167,7 +180,7 @@ def get_machine_id(data: Dict[str, Any]) -> str:
         data.get("machine_id")
         or data.get("machineId")
         or data.get("machine")
-        or "unknown-machine"
+        or "machine-001"
     )
 
 
@@ -175,10 +188,11 @@ def extract_sample(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Converts normalized telemetry into the fields required for inference.
     Expected input fields:
-      device_id, machine_id, reading_index,
+      factory_id, device_id, machine_id, reading_index,
       temperature_c, x_g, y_g, z_g, vibration_mag_g
     """
 
+    factory_id = get_factory_id(data)
     device_id = get_device_id(data)
     machine_id = get_machine_id(data)
 
@@ -201,11 +215,21 @@ def extract_sample(data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         vibration_mag_g = safe_float(vibration_mag_g, default=np.nan)
 
+    # Prefer gateway timestamp, but accept other aliases.
+    ts_gateway = (
+        data.get("ts_gateway")
+        or data.get("gateway_ts")
+        or data.get("timestamp")
+        or data.get("ts")
+        or now_iso_utc()
+    )
+
     sample = {
+        "factory_id": factory_id,
         "device_id": device_id,
         "machine_id": machine_id,
         "reading_index": safe_int(data.get("reading_index", data.get("idx")), default=0),
-        "ts_gateway": data.get("ts_gateway") or data.get("timestamp") or data.get("ts"),
+        "ts_gateway": ts_gateway,
         "temperature_c": temperature_c,
         "x_g": x_g,
         "y_g": y_g,
@@ -221,7 +245,7 @@ def build_features(window_samples: list) -> Tuple[pd.DataFrame, Dict[str, float]
     """
     Builds one feature row from one window.
 
-    This feature order must match the training script:
+    Feature order must match the training script:
       temp_mean, temp_std, temp_min, temp_max,
       vib_mean, vib_std, vib_min, vib_max
     """
@@ -285,7 +309,6 @@ def load_models() -> None:
             log(f"[WARN] Could not parse INFERENCE_DEVICE_MODELS: {exc}")
 
     # Try common model names for current devices.
-    # This allows the service to work without explicit env mapping.
     known_devices = ["esp32-001", "esp32-002"]
 
     for device_id in known_devices:
@@ -322,7 +345,6 @@ def get_model_for_device(device_id: str) -> Optional[Any]:
     if device_id in models:
         return models[device_id]
 
-    # Also try normalized ID, in case incoming ID format differs
     normalized = device_id.replace("_", "-")
     if normalized in models:
         return models[normalized]
@@ -340,7 +362,7 @@ def ewma_update_signal(device_id: str, signal_name: str, value: float) -> Tuple[
       is_anomaly, normalized_residual
     """
 
-    key = f"{signal_name}"
+    key = signal_name
 
     if key not in ewma_state[device_id]:
         ewma_state[device_id][key] = {
@@ -371,7 +393,7 @@ def ewma_update_signal(device_id: str, signal_name: str, value: float) -> Tuple[
     normalized_residual = float(residual / std)
     is_anomaly = abs(normalized_residual) >= EWMA_THRESHOLD
 
-    return is_anomaly, normalized_residual
+    return bool(is_anomaly), normalized_residual
 
 
 def ewma_detect(device_id: str, features: Dict[str, float]) -> Tuple[bool, Dict[str, Any]]:
@@ -402,11 +424,14 @@ def ml_detect(device_id: str, feature_df: pd.DataFrame) -> Tuple[bool, Dict[str,
             "ml_anomaly": False,
             "ml_available": False,
             "ml_reason": "no_model_for_device",
+            "ml_prediction": 1,
+            "ml_score": 0.0,
+            "ml_model_device": "none",
         }
 
     try:
-        pred = model.predict(feature_df)[0]
-        score = None
+        pred = int(model.predict(feature_df)[0])
+        score = 0.0
 
         if hasattr(model, "decision_function"):
             score = float(model.decision_function(feature_df)[0])
@@ -416,7 +441,7 @@ def ml_detect(device_id: str, feature_df: pd.DataFrame) -> Tuple[bool, Dict[str,
         return bool(is_anomaly), {
             "ml_anomaly": bool(is_anomaly),
             "ml_available": True,
-            "ml_prediction": int(pred),
+            "ml_prediction": pred,
             "ml_score": score,
             "ml_model_device": device_id if device_id in models else "fallback",
         }
@@ -427,6 +452,9 @@ def ml_detect(device_id: str, feature_df: pd.DataFrame) -> Tuple[bool, Dict[str,
             "ml_anomaly": False,
             "ml_available": False,
             "ml_reason": f"prediction_error: {exc}",
+            "ml_prediction": 1,
+            "ml_score": 0.0,
+            "ml_model_device": "error",
         }
 
 
@@ -458,7 +486,7 @@ def make_final_decision(
     # Default: hybrid
     if DETECTION_MODE == "hybrid":
         if ewma_anomaly and ml_anomaly:
-            return True, "ewma_and_ml", "high"
+            return True, "ml_and_ewma", "critical"
         if ml_anomaly:
             return True, "ml_only", "high"
         if ewma_anomaly:
@@ -468,11 +496,11 @@ def make_final_decision(
     # Unknown mode fallback
     log(f"[WARN] Unknown DETECTION_MODE={DETECTION_MODE}, using hybrid behavior")
 
-    if ewma_anomaly or ml_anomaly:
-        if ewma_anomaly and ml_anomaly:
-            return True, "ewma_and_ml", "high"
-        if ml_anomaly:
-            return True, "ml_only", "high"
+    if ewma_anomaly and ml_anomaly:
+        return True, "ml_and_ewma", "critical"
+    if ml_anomaly:
+        return True, "ml_only", "high"
+    if ewma_anomaly:
         return True, "ewma_only", "medium"
 
     return False, "normal", "info"
@@ -480,6 +508,7 @@ def make_final_decision(
 
 def publish_inference_result(
     client: mqtt.Client,
+    factory_id: str,
     device_id: str,
     machine_id: str,
     window_samples: list,
@@ -496,21 +525,75 @@ def publish_inference_result(
     ts_ms = now_ms()
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000))
 
+    window_start_ts = first.get("ts_gateway") or ts_iso
+    window_end_ts = last.get("ts_gateway") or ts_iso
+
+    window_start_index = int(first.get("reading_index") or 0)
+    window_end_index = int(last.get("reading_index") or 0)
+
+    ml_score = ml_details.get("ml_score")
+    if ml_score is None:
+        ml_score = 0.0
+
+    if_pred = ml_details.get("ml_prediction")
+    if if_pred is None:
+        if_pred = 1
+
+    is_anomaly_ml = 1 if bool(ml_details.get("ml_anomaly", False)) else 0
+    is_anomaly_ewma = 1 if bool(ewma_details.get("ewma_anomaly", False)) else 0
+    is_anomaly_final = 1 if bool(is_final_anomaly) else 0
+
+    temp_zscore = float(ewma_details.get("ewma_temp_residual", 0.0) or 0.0)
+
+    # Keep event_processing naming convention.
+    anomaly_reason = reason
+    if anomaly_reason == "ewma_and_ml":
+        anomaly_reason = "ml_and_ewma"
+
+    # Event-processing service expects a flat legacy-compatible schema.
     result = {
         "schema": "mva.inference.v1",
+
+        # Required by event_processing/app.py
         "ts_inference": ts_iso,
-        "ts_inference_ms": ts_ms,
-        "device_id": device_id,
+        "window_start_ts": window_start_ts,
+        "window_end_ts": window_end_ts,
+
+        "factory_id": factory_id,
         "machine_id": machine_id,
-        "reading_index_start": first.get("reading_index"),
-        "reading_index_end": last.get("reading_index"),
+        "device_id": device_id,
+
+        "window_start_index": window_start_index,
+        "window_end_index": window_end_index,
         "window_size": WINDOW_SIZE,
         "window_step": WINDOW_STEP,
+
+        "if_score": float(ml_score),
+        "if_pred": int(if_pred),
+        "is_anomaly_ml": int(is_anomaly_ml),
+        "temp_zscore": float(temp_zscore),
+        "is_anomaly_ewma": int(is_anomaly_ewma),
+        "is_anomaly_final": int(is_anomaly_final),
+        "anomaly_reason": anomaly_reason,
+
+        # Extra compatibility / debugging fields
+        "ts_inference_ms": ts_ms,
+        "reading_index_start": window_start_index,
+        "reading_index_end": window_end_index,
         "detection_mode": DETECTION_MODE,
         "is_anomaly": bool(is_final_anomaly),
-        "is_final": 1 if is_final_anomaly else 0,
+        "is_final": is_anomaly_final,
         "reason": reason,
         "severity": severity,
+
+        # Flattened features for event DB columns
+        "temp_mean": float(feature_values.get("temp_mean", 0.0)),
+        "temp_std": float(feature_values.get("temp_std", 0.0)),
+        "vib_mean": float(feature_values.get("vib_mean", 0.0)),
+        "vib_std": float(feature_values.get("vib_std", 0.0)),
+        "vib_rms": float(feature_values.get("vib_mean", 0.0)),
+
+        # Nested details retained for debugging
         "features": feature_values,
         "ewma": ewma_details,
         "ml": ml_details,
@@ -547,6 +630,7 @@ def on_message(client, userdata, msg):
 
     sample = extract_sample(data)
 
+    factory_id = sample["factory_id"]
     device_id = sample["device_id"]
     machine_id = sample["machine_id"]
 
@@ -582,6 +666,7 @@ def on_message(client, userdata, msg):
 
     publish_inference_result(
         client=client,
+        factory_id=factory_id,
         device_id=device_id,
         machine_id=machine_id,
         window_samples=window_samples,
