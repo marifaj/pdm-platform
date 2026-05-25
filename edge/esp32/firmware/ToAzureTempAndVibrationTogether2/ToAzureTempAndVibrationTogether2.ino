@@ -1,0 +1,614 @@
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <PubSubClient.h>
+#include <math.h>
+
+// ======================================================
+// SENSOR / WIRING NOTES
+// ======================================================
+// DS18B20
+// red    -> 3.3V
+// black  -> GND
+// yellow -> GPIO4
+//
+// ADXL345
+// VCC -> 3.3V
+// GND -> GND
+// SDA (green)  -> GPIO21
+// SCL (yellow) -> GPIO22
+// CS  -> 3.3V
+// SDO -> GND
+//
+// IMPORTANT:
+// - ADXL345 is configured for FULL_RES + +/-2g
+// - scale factor = 3.9 mg/LSB = 0.0039 g/LSB
+// - PubSubClient publishes with MQTT QoS 0. Reliability is evaluated
+//   through readingIndex sequence gaps and publish-failure counters.
+
+// ======================================================
+// EXPERIMENT CONFIG - CHANGE ONLY THESE FOR EACH RUN
+// ======================================================
+const char* runId = "AZURE_VM_MQTT_SMOKE_ESP32_002";
+
+// Use 50 for the first two-device normal run, then 100 for stress run.
+const int TARGET_HZ = 10;
+
+// Keep false for normal runs. Set true only for the anomaly run on device 002.
+bool FORCE_ANOMALY = false;
+
+// ======================================================
+// WIFI CONFIG
+// ======================================================
+const char* ssid = "Klea";
+const char* password = "rinesanart";
+
+// ======================================================
+// MQTT CONFIG
+// ======================================================
+const char* mqttServer = "4.182.25.160";   // Pi4 IP
+const int mqttPort = 1883;
+const char* mqttTopic = "mva/raw/telemetry";
+const char* mqttClientId = "esp32-002-cloud-smoke";
+
+// ======================================================
+// IDs
+// ======================================================
+const char* factoryId = "factory-001";
+const char* machineId = "machine-001";
+const char* deviceId = "esp32-002";
+
+// ======================================================
+// ANOMALY SIMULATION CONFIG
+// ======================================================
+// The schedule is time-based through TARGET_HZ, so it keeps the same
+// minutes/seconds whether you run at 50 Hz or 100 Hz.
+//
+// Planned short journal experiment schedule:
+// 00:00-05:00 normal
+// 05:00-08:00 temperature-only anomaly
+// 08:00-11:00 recovery
+// 11:00-14:00 vibration-only anomaly
+// 14:00-17:00 recovery
+// 17:00-20:00 temperature + vibration anomaly
+// 20:00+      recovery/final normal
+
+#define SEC_TO_INDEX(sec) ((uint32_t)((sec) * TARGET_HZ) + 1UL)
+#define SEC_TO_COUNT(sec) ((uint32_t)((sec) * TARGET_HZ))
+
+enum AnomalyMode {
+  ANOM_NONE = 0,
+  ANOM_TEMP_ONLY = 1,
+  ANOM_VIB_ONLY = 2,
+  ANOM_BOTH = 3
+};
+
+struct AnomalySegment {
+  uint32_t startIndex;
+  uint32_t count;
+  AnomalyMode mode;
+};
+
+const AnomalySegment ANOMALY_SCHEDULE[] = {
+  {SEC_TO_INDEX(60),  SEC_TO_COUNT(40), ANOM_TEMP_ONLY}, // 01:00-01:40
+  {SEC_TO_INDEX(180), SEC_TO_COUNT(40), ANOM_VIB_ONLY},  // 03:00-03:40
+  {SEC_TO_INDEX(300), SEC_TO_COUNT(40), ANOM_BOTH}       // 05:00-05:40
+};
+
+const size_t ANOMALY_SCHEDULE_COUNT =
+  sizeof(ANOMALY_SCHEDULE) / sizeof(ANOMALY_SCHEDULE[0]);
+
+// Forced anomaly values
+const float FORCED_TEMP_C = 38.0f;
+const float FORCED_X_G = 1.40f;
+const float FORCED_Y_G = 1.10f;
+const float FORCED_Z_G = 0.30f;
+
+// ======================================================
+// DS18B20
+// ======================================================
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensors(&oneWire);
+
+// ======================================================
+// ADXL345
+// ======================================================
+#define ADXL345_ADDR 0x53
+#define ADXL345_DEVID_REG 0x00
+#define ADXL345_POWER_CTL 0x2D
+#define ADXL345_DATA_FORMAT 0x31
+#define ADXL345_BW_RATE 0x2C
+#define ADXL345_DATAX0 0x32
+
+const float ADXL345_SCALE_G_PER_LSB = 0.0039f; // full-res +/-2g
+
+// ======================================================
+// WIFI / MQTT OBJECTS
+// ======================================================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// ======================================================
+// TIMING
+// ======================================================
+const unsigned long publishIntervalMs = 1000UL / TARGET_HZ;
+const unsigned long tempConversionWaitMs = 800; // safe for 12-bit DS18B20
+const unsigned long statusPrintIntervalMs = 10000; // one status line every 10s
+
+unsigned long lastPublishTime = 0;
+unsigned long lastTempRequestTime = 0;
+unsigned long lastStatusPrintTime = 0;
+bool tempConversionInProgress = false;
+
+// ======================================================
+// STATE / COUNTERS
+// ======================================================
+uint32_t readingIndex = 1;
+float latestTempC = NAN;
+
+uint32_t mqttPublishOk = 0;
+uint32_t mqttPublishFailed = 0;
+uint32_t wifiReconnectCount = 0;
+uint32_t mqttReconnectAttemptCount = 0;
+uint32_t mqttReconnectSuccessCount = 0;
+
+// ======================================================
+// HELPERS
+// ======================================================
+const char* anomalyModeToString(AnomalyMode mode) {
+  switch (mode) {
+    case ANOM_NONE:      return "none";
+    case ANOM_TEMP_ONLY: return "temp_only";
+    case ANOM_VIB_ONLY:  return "vib_only";
+    case ANOM_BOTH:      return "both";
+    default:             return "unknown";
+  }
+}
+
+AnomalyMode scheduledAnomalyMode(uint32_t idx) {
+  if (!FORCE_ANOMALY) return ANOM_NONE;
+
+  for (size_t i = 0; i < ANOMALY_SCHEDULE_COUNT; i++) {
+    uint32_t startIdx = ANOMALY_SCHEDULE[i].startIndex;
+    uint32_t endIdx = startIdx + ANOMALY_SCHEDULE[i].count;
+
+    if (idx >= startIdx && idx < endIdx) {
+      return ANOMALY_SCHEDULE[i].mode;
+    }
+  }
+
+  return ANOM_NONE;
+}
+
+uint8_t adxlBwRateForTargetHz() {
+  // ADXL345 BW_RATE codes: 0x09 = 50 Hz, 0x0A = 100 Hz, 0x0B = 200 Hz.
+  // For target rates above 100, use at least 200 Hz output data rate.
+  if (TARGET_HZ <= 50) return 0x09;
+  if (TARGET_HZ <= 100) return 0x0A;
+  return 0x0B;
+}
+
+void printAnomalySchedule() {
+  Serial.println("Anomaly schedule:");
+  for (size_t i = 0; i < ANOMALY_SCHEDULE_COUNT; i++) {
+    uint32_t startIdx = ANOMALY_SCHEDULE[i].startIndex;
+    uint32_t endIdx = startIdx + ANOMALY_SCHEDULE[i].count - 1;
+
+    Serial.print("  Segment ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(anomalyModeToString(ANOMALY_SCHEDULE[i].mode));
+    Serial.print(" | startIndex=");
+    Serial.print(startIdx);
+    Serial.print(" | endIndex=");
+    Serial.print(endIdx);
+    Serial.print(" | count=");
+    Serial.println(ANOMALY_SCHEDULE[i].count);
+  }
+}
+
+void printRunConfig() {
+  Serial.println("------------------------------------");
+  Serial.println("RUN CONFIG");
+  Serial.print("runId = ");
+  Serial.println(runId);
+  Serial.print("deviceId = ");
+  Serial.println(deviceId);
+  Serial.print("mqttClientId = ");
+  Serial.println(mqttClientId);
+  Serial.print("mqttTopic = ");
+  Serial.println(mqttTopic);
+  Serial.print("TARGET_HZ = ");
+  Serial.println(TARGET_HZ);
+  Serial.print("publishIntervalMs = ");
+  Serial.println(publishIntervalMs);
+  Serial.print("FORCE_ANOMALY = ");
+  Serial.println(FORCE_ANOMALY ? "true" : "false");
+  printAnomalySchedule();
+  Serial.println("------------------------------------");
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void setupOTA() {
+  ArduinoOTA.setHostname("esp32-temp-vibration-002");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA update started");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA update finished");
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]\n", error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("OTA ready");
+}
+
+void setupMQTT() {
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setBufferSize(768);
+  mqttClient.setKeepAlive(20);
+  mqttClient.setSocketTimeout(3);
+}
+
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    mqttReconnectAttemptCount++;
+    Serial.print("Connecting to MQTT... ");
+
+    if (mqttClient.connect(mqttClientId)) {
+      mqttReconnectSuccessCount++;
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 2 seconds...");
+      delay(2000);
+    }
+  }
+}
+
+void printStatusLine() {
+  Serial.print("STATUS | runId=");
+  Serial.print(runId);
+  Serial.print(" | deviceId=");
+  Serial.print(deviceId);
+  Serial.print(" | readingIndex=");
+  Serial.print(readingIndex);
+  Serial.print(" | ok=");
+  Serial.print(mqttPublishOk);
+  Serial.print(" | failed=");
+  Serial.print(mqttPublishFailed);
+  Serial.print(" | WiFiRSSI=");
+  Serial.print(WiFi.RSSI());
+  Serial.print(" | freeHeap=");
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(" | mqttState=");
+  Serial.println(mqttClient.state());
+}
+
+// ======================================================
+// ADXL345 LOW-LEVEL FUNCTIONS
+// ======================================================
+bool writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
+
+bool readRegister(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t received = Wire.requestFrom((uint8_t)ADXL345_ADDR, (uint8_t)1);
+  if (received != 1) {
+    return false;
+  }
+
+  value = Wire.read();
+  return true;
+}
+
+bool readRegisters(uint8_t startReg, uint8_t count, uint8_t *data) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(startReg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  uint8_t received = Wire.requestFrom((uint8_t)ADXL345_ADDR, count);
+  if (received != count) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    data[i] = Wire.read();
+  }
+
+  return true;
+}
+
+bool setupADXL345() {
+  uint8_t devid = 0;
+  if (!readRegister(ADXL345_DEVID_REG, devid)) {
+    Serial.println("ERROR: Failed to read ADXL345 DEVID");
+    return false;
+  }
+
+  Serial.print("ADXL345 DEVID = 0x");
+  Serial.println(devid, HEX);
+
+  if (devid != 0xE5) {
+    Serial.println("ERROR: Unexpected ADXL345 device ID");
+    return false;
+  }
+
+  // Standby before configuration
+  if (!writeRegister(ADXL345_POWER_CTL, 0x00)) return false;
+
+  // Full resolution, +/-2g
+  if (!writeRegister(ADXL345_DATA_FORMAT, 0x08)) return false;
+
+  // Output data rate matched to target publish rate
+  uint8_t bwRate = adxlBwRateForTargetHz();
+  if (!writeRegister(ADXL345_BW_RATE, bwRate)) return false;
+  Serial.print("ADXL345 BW_RATE code = 0x");
+  Serial.println(bwRate, HEX);
+
+  // Measurement mode
+  if (!writeRegister(ADXL345_POWER_CTL, 0x08)) return false;
+
+  delay(100);
+  return true;
+}
+
+bool readADXL345(int16_t &x, int16_t &y, int16_t &z) {
+  uint8_t rawData[6] = {0};
+
+  if (!readRegisters(ADXL345_DATAX0, 6, rawData)) {
+    return false;
+  }
+
+  x = (int16_t)((rawData[1] << 8) | rawData[0]);
+  y = (int16_t)((rawData[3] << 8) | rawData[2]);
+  z = (int16_t)((rawData[5] << 8) | rawData[4]);
+
+  return true;
+}
+
+// ======================================================
+// DS18B20 HELPERS
+// ======================================================
+void setupDS18B20() {
+  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
+  tempSensors.begin();
+  tempSensors.setWaitForConversion(false);  // non-blocking
+
+  int deviceCount = tempSensors.getDeviceCount();
+  Serial.print("DS18B20 device count = ");
+  Serial.println(deviceCount);
+
+  if (deviceCount == 0) {
+    Serial.println("WARNING: No DS18B20 detected");
+  }
+
+  tempSensors.requestTemperatures();
+  lastTempRequestTime = millis();
+  tempConversionInProgress = true;
+}
+
+void updateTemperatureAsync() {
+  unsigned long now = millis();
+
+  if (tempConversionInProgress) {
+    if (now - lastTempRequestTime >= tempConversionWaitMs) {
+      float t = tempSensors.getTempCByIndex(0);
+      if (t != DEVICE_DISCONNECTED_C) {
+        latestTempC = t;
+      } else {
+        Serial.println("WARNING: DS18B20 disconnected or invalid reading");
+      }
+
+      tempSensors.requestTemperatures();
+      lastTempRequestTime = now;
+    }
+  } else {
+    tempSensors.requestTemperatures();
+    lastTempRequestTime = now;
+    tempConversionInProgress = true;
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Starting ESP32 temperature + vibration telemetry system...");
+
+  printRunConfig();
+
+  // Sensors
+  setupDS18B20();
+
+  Wire.begin(21, 22);
+  delay(200);
+
+  if (!setupADXL345()) {
+    Serial.println("FATAL: ADXL345 setup failed");
+  } else {
+    Serial.println("ADXL345 initialized successfully");
+  }
+
+  // Network and services
+  connectWiFi();
+  setupOTA();
+  setupMQTT();
+
+  Serial.println("System ready");
+  Serial.println("------------------------------------");
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+void loop() {
+  ArduinoOTA.handle();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiReconnectCount++;
+    Serial.println("WiFi disconnected -> reconnecting");
+    connectWiFi();
+  }
+
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  updateTemperatureAsync();
+
+  unsigned long now = millis();
+  if (now - lastStatusPrintTime >= statusPrintIntervalMs) {
+    lastStatusPrintTime = now;
+    printStatusLine();
+  }
+
+  if (now - lastPublishTime >= publishIntervalMs) {
+    lastPublishTime = now;
+
+    int16_t x = 0, y = 0, z = 0;
+    if (!readADXL345(x, y, z)) {
+      Serial.println("ERROR: Failed to read ADXL345 data");
+      return;
+    }
+
+    // Do not publish until temperature is valid
+    if (isnan(latestTempC) || latestTempC == DEVICE_DISCONNECTED_C) {
+      return;
+    }
+
+    int16_t rawXToSend = x;
+    int16_t rawYToSend = y;
+    int16_t rawZToSend = z;
+
+    float x_g = x * ADXL345_SCALE_G_PER_LSB;
+    float y_g = y * ADXL345_SCALE_G_PER_LSB;
+    float z_g = z * ADXL345_SCALE_G_PER_LSB;
+    float tempToSend = latestTempC;
+
+    AnomalyMode modeNow = scheduledAnomalyMode(readingIndex);
+    bool anomalyNow = (modeNow != ANOM_NONE);
+
+    if (anomalyNow) {
+      if (modeNow == ANOM_TEMP_ONLY || modeNow == ANOM_BOTH) {
+        tempToSend = FORCED_TEMP_C;
+      }
+
+      if (modeNow == ANOM_VIB_ONLY || modeNow == ANOM_BOTH) {
+        x_g = FORCED_X_G;
+        y_g = FORCED_Y_G;
+        z_g = FORCED_Z_G;
+
+        rawXToSend = (int16_t)lroundf(FORCED_X_G / ADXL345_SCALE_G_PER_LSB);
+        rawYToSend = (int16_t)lroundf(FORCED_Y_G / ADXL345_SCALE_G_PER_LSB);
+        rawZToSend = (int16_t)lroundf(FORCED_Z_G / ADXL345_SCALE_G_PER_LSB);
+      }
+
+      // Avoid printing every anomaly message because it can disturb 50/100 Hz publishing.
+      if (readingIndex % (TARGET_HZ * 5) == 0) {
+        Serial.print(">>> FORCED ANOMALY ACTIVE: ");
+        Serial.print(anomalyModeToString(modeNow));
+        Serial.println(" <<<");
+      }
+    }
+
+    char payload[768];
+    snprintf(
+      payload,
+      sizeof(payload),
+      "{\"runId\":\"%s\",\"targetHz\":%d,\"espMillis\":%lu,\"factoryId\":\"%s\",\"machineId\":\"%s\",\"deviceId\":\"%s\",\"readingIndex\":%lu,\"temperatureC\":%.2f,\"rawX\":%d,\"rawY\":%d,\"rawZ\":%d,\"x_g\":%.3f,\"y_g\":%.3f,\"z_g\":%.3f,\"mode\":\"%s\"}",
+      runId,
+      TARGET_HZ,
+      (unsigned long)millis(),
+      factoryId,
+      machineId,
+      deviceId,
+      (unsigned long)readingIndex,
+      tempToSend,
+      rawXToSend,
+      rawYToSend,
+      rawZToSend,
+      x_g,
+      y_g,
+      z_g,
+      anomalyNow ? anomalyModeToString(modeNow) : "normal"
+    );
+
+    bool published = mqttClient.publish(mqttTopic, payload, false);
+
+    if (published) {
+      mqttPublishOk++;
+
+      // Print only once every 10 seconds during normal operation.
+      if (readingIndex % (TARGET_HZ * 10) == 0) {
+        Serial.print("Published reading ");
+        Serial.print(readingIndex);
+        Serial.print(" | mode=");
+        Serial.print(anomalyNow ? anomalyModeToString(modeNow) : "normal");
+        Serial.print(" | TempC=");
+        Serial.print(tempToSend, 2);
+        Serial.print(" | Xg=");
+        Serial.print(x_g, 3);
+        Serial.print(" | Yg=");
+        Serial.print(y_g, 3);
+        Serial.print(" | Zg=");
+        Serial.println(z_g, 3);
+      }
+    } else {
+      mqttPublishFailed++;
+      Serial.print("MQTT publish FAILED | readingIndex=");
+      Serial.print(readingIndex);
+      Serial.print(" | WiFi.status=");
+      Serial.print(WiFi.status());
+      Serial.print(" | mqtt.connected=");
+      Serial.print(mqttClient.connected() ? "true" : "false");
+      Serial.print(" | mqtt.state=");
+      Serial.print(mqttClient.state());
+      Serial.print(" | heap=");
+      Serial.println(ESP.getFreeHeap());
+    }
+
+    readingIndex++;
+  }
+}
