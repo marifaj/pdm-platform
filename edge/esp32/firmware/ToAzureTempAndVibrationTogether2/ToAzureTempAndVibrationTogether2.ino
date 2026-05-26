@@ -34,7 +34,7 @@
 const char* runId = "AZURE_VM_MQTT_SMOKE_ESP32_002";
 
 // Use 50 for the first two-device normal run, then 100 for stress run.
-const int TARGET_HZ = 10;
+const int TARGET_HZ = 100;
 
 // Keep false for normal runs. Set true only for the anomaly run on device 002.
 bool FORCE_ANOMALY = false;
