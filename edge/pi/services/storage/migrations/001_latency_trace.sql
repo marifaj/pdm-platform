@@ -1,24 +1,3 @@
-CREATE TABLE IF NOT EXISTS telemetry_normalized (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts_gateway TEXT NOT NULL,
-    factory_id TEXT NOT NULL,
-    machine_id TEXT NOT NULL,
-    device_id TEXT NOT NULL,
-    reading_index INTEGER NOT NULL,
-    temperature_c REAL,
-    raw_x INTEGER,
-    raw_y INTEGER,
-    raw_z INTEGER,
-    x_g REAL,
-    y_g REAL,
-    z_g REAL,
-    vibration_mag_g REAL,
-    payload_json TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_ts ON telemetry_normalized(ts_gateway);
-CREATE INDEX IF NOT EXISTS idx_machine ON telemetry_normalized(machine_id);
-
 CREATE TABLE IF NOT EXISTS latency_trace (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT,
@@ -27,29 +6,21 @@ CREATE TABLE IF NOT EXISTS latency_trace (
   machine_id TEXT,
   device_id TEXT,
   reading_index INTEGER,
-
   esp_millis INTEGER,
-
   ts_publish_client INTEGER,
-
   ts_ingestion_received INTEGER,
   ts_ingestion_published INTEGER,
-
   ts_storage_received INTEGER,
   ts_storage_inserted INTEGER,
-
   ts_inference_received INTEGER,
   ts_inference_start INTEGER,
   ts_inference_end INTEGER,
   ts_prediction_published INTEGER,
-
   ts_event_received INTEGER,
   ts_event_created INTEGER,
   ts_event_published INTEGER,
-
   ts_notification_received INTEGER,
   ts_notification_created INTEGER,
-
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -58,5 +29,3 @@ ON latency_trace(run_id, device_id, reading_index);
 
 CREATE INDEX IF NOT EXISTS idx_latency_trace_trace_id
 ON latency_trace(trace_id);
-
-ALTER TABLE events ADD COLUMN reading_index INTEGER;
