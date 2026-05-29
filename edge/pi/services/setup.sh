@@ -22,8 +22,22 @@ REQ
 fi
 
 echo "==> Creating virtual environment..."
+PYTHON_BIN=""
+if [[ -n "${MVA_PYTHON_BIN:-}" && -x "$MVA_PYTHON_BIN" ]]; then
+  PYTHON_BIN="$MVA_PYTHON_BIN"
+elif [[ -x "$HOME/.pyenv/versions/3.12.13/bin/python" ]]; then
+  PYTHON_BIN="$HOME/.pyenv/versions/3.12.13/bin/python"
+elif command -v python3.12 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3.12)"
+elif command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3.11)"
+else
+  PYTHON_BIN="$(command -v python3)"
+  echo "⚠️  WARNING: Falling back to python3. Python 3.13 may be incompatible with numpy==1.26.4 and onnxruntime==1.18.1."
+fi
+echo "==> Selected Python: $("$PYTHON_BIN" --version) ($PYTHON_BIN)"
 if [[ ! -x "$MVA_HOME/.venv/bin/python" ]]; then
-  python3 -m venv "$MVA_HOME/.venv"
+  "$PYTHON_BIN" -m venv "$MVA_HOME/.venv"
 fi
 
 . "$MVA_HOME/.venv/bin/activate"
