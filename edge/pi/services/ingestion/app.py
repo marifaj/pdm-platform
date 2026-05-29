@@ -11,13 +11,21 @@ import paho.mqtt.client as mqtt
 
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+RUN_ID = os.getenv("RUN_ID", "manual")
+DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "unknown")
 
 IN_TOPIC = "factory/+/machine/+/telemetry"
 OUT_TOPIC = "mva/normalized/telemetry"
 QUARANTINE_TOPIC = "mva/quarantine/telemetry"
 
-def iso_now():
+def utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+def first_present(d, keys, default=None):
+    for key in keys:
+        if key in d and d[key] not in (None, ""):
+            return d[key]
+    return default
 
 def is_number(x):
     try:
@@ -59,13 +67,22 @@ def normalize_payload(d):
     zg = float(d["z_g"])
 
     vibration_mag_g = math.sqrt(xg*xg + yg*yg + zg*zg)
+    ts_ingestion = utc_now_iso()
+    run_id = str(first_present(d, ["run_id", "runId"], RUN_ID))
+    device_id = d["deviceId"]
+    reading_index = int(d["readingIndex"])
 
-    return {
+    normalized = {
         "factory_id": d["factoryId"],
         "machine_id": d["machineId"],
-        "device_id": d["deviceId"],
-        "reading_index": int(d["readingIndex"]),
-        "ts_gateway": iso_now(),
+        "device_id": device_id,
+        "reading_index": reading_index,
+        # ts_ingestion/ts_gateway is service-receive time, not true ESP32 clock time.
+        "ts_ingestion": ts_ingestion,
+        "ts_gateway": ts_ingestion,
+        "run_id": run_id,
+        "deployment_mode": DEPLOYMENT_MODE,
+        "trace_id": f"{run_id}:{device_id}:{reading_index}",
         "temperature_c": float(d["temperatureC"]),
         "raw_x": int(d["rawX"]),
         "raw_y": int(d["rawY"]),
@@ -76,6 +93,9 @@ def normalize_payload(d):
         "vibration_mag_g": vibration_mag_g,
         "payload_json": d
     }
+    if "espMillis" in d:
+        normalized["espMillis"] = d["espMillis"]
+    return normalized
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print(f"[MQTT] connected rc={rc}")

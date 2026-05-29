@@ -72,86 +72,78 @@ cat > "$MVA_HOME/storage/config/retention.json" <<'JSON'
 JSON
 
 SCHEMA_FILE="$MVA_HOME/storage/schema.sql"
-cat > "$SCHEMA_FILE" <<'SQL'
-PRAGMA journal_mode=WAL;
-
+SERVICE_SCHEMA="$MVA_HOME/pi/services/storage/schema.sql"
+if [[ -f "$SERVICE_SCHEMA" ]]; then
+  cp "$SERVICE_SCHEMA" "$SCHEMA_FILE"
+else
+  cat > "$SCHEMA_FILE" <<'SQL'
 CREATE TABLE IF NOT EXISTS telemetry_normalized (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_gateway TEXT NOT NULL,
+    factory_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    reading_index INTEGER NOT NULL,
+    temperature_c REAL,
+    raw_x INTEGER,
+    raw_y INTEGER,
+    raw_z INTEGER,
+    x_g REAL,
+    y_g REAL,
+    z_g REAL,
+    vibration_mag_g REAL,
+    ts_storage TEXT,
+    payload_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ts ON telemetry_normalized(ts_gateway);
+CREATE INDEX IF NOT EXISTS idx_machine ON telemetry_normalized(machine_id);
+
+CREATE TABLE IF NOT EXISTS latency_trace (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT,
+  trace_id TEXT,
+  deployment_mode TEXT,
   factory_id TEXT,
   machine_id TEXT,
   device_id TEXT,
   reading_index INTEGER,
-  ts_gateway TEXT,
-  temperature_c REAL,
-  raw_x REAL,
-  raw_y REAL,
-  raw_z REAL,
-  x_g REAL,
-  y_g REAL,
-  z_g REAL,
-  vibration_mag_g REAL,
-  payload_json TEXT,
+  window_start_index INTEGER,
+  window_end_index INTEGER,
+  esp_millis INTEGER,
+  ts_ingestion TEXT,
+  ts_storage TEXT,
+  ts_inference TEXT,
+  ts_event TEXT,
+  ts_notification TEXT,
+  ingestion_to_inference_ms INTEGER,
+  inference_to_event_ms INTEGER,
+  event_to_notification_ms INTEGER,
+  end_to_alert_ms INTEGER,
+  ts_publish_client INTEGER,
+  ts_ingestion_received INTEGER,
+  ts_ingestion_published INTEGER,
+  ts_storage_received INTEGER,
+  ts_storage_inserted INTEGER,
+  ts_inference_received INTEGER,
+  ts_inference_start INTEGER,
+  ts_inference_end INTEGER,
+  ts_prediction_published INTEGER,
+  ts_event_received INTEGER,
+  ts_event_created INTEGER,
+  ts_event_published INTEGER,
+  ts_notification_received INTEGER,
+  ts_notification_created INTEGER,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_tel_norm_device_ts
-ON telemetry_normalized(device_id, ts_gateway);
+CREATE INDEX IF NOT EXISTS idx_latency_trace_run_device_reading
+ON latency_trace(run_id, device_id, reading_index);
 
-CREATE TABLE IF NOT EXISTS events (
-  event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  msg_id TEXT,
-  device_id TEXT,
-  ts_utc TEXT,
-  severity TEXT,
-  rule_id TEXT,
-  thresholds_json TEXT,
-  meta_json TEXT,
-  bucket_date TEXT,
-  trace_id TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_device_ts
-ON events(device_id, ts_utc);
-
-CREATE TABLE IF NOT EXISTS incidents (
-  incident_id TEXT PRIMARY KEY,
-  device_id TEXT,
-  status TEXT,
-  severity_current TEXT,
-  severity_peak TEXT,
-  opened_at TEXT,
-  last_seen_at TEXT,
-  occurrences INTEGER,
-  rule_id TEXT,
-  cleared_by TEXT,
-  cleared_at TEXT,
-  trace_id TEXT,
-  meta_json TEXT,
-  score_min REAL,
-  score_max REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_incidents_device
-ON incidents(device_id);
-
-CREATE TABLE IF NOT EXISTS notifications (
-  notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  incident_id TEXT,
-  channel TEXT,
-  status TEXT,
-  attempt_count INTEGER,
-  delivered_at TEXT,
-  provider_msg_id TEXT,
-  trace_id TEXT,
-  meta_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS storage_migrations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  filename TEXT UNIQUE,
-  applied_at TEXT
-);
+CREATE INDEX IF NOT EXISTS idx_latency_trace_trace_id
+ON latency_trace(trace_id);
 SQL
+fi
 
 echo "==> Initializing SQLite schema..."
 "$MVA_HOME/.venv/bin/python" - <<'PY'

@@ -39,6 +39,9 @@ os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
 def log(msg):
     line = f"{now_iso()} data-storage {msg}"
     print(line, flush=True)
@@ -59,9 +62,32 @@ def apply_schema(con):
         log(f"[WARN] schema file not found: {SCHEMA_PATH}")
         return
     with open(SCHEMA_PATH, "r") as f:
-        con.executescript(f.read())
+        statements = [s.strip() for s in f.read().split(";") if s.strip()]
+    for statement in statements:
+        try:
+            con.execute(statement)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "duplicate column name" in msg:
+                continue
+            if "no such table: events" in msg:
+                continue
+            raise
     con.commit()
     log("[BOOT] schema ensured")
+
+def table_columns(table_name):
+    rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+def safe_add_column(table_name, column_sql):
+    try:
+        con.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+        con.commit()
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e).lower():
+            return
+        raise
 
 def validate_normalized_payload(d):
     required = [
@@ -89,43 +115,50 @@ def validate_normalized_payload(d):
 # =========================
 con = connect_db()
 apply_schema(con)
+safe_add_column("telemetry_normalized", "ts_storage TEXT")
+TELEMETRY_COLUMNS = table_columns("telemetry_normalized")
 
 def insert_telemetry(d):
+    d["ts_storage"] = utc_now_iso()
+    columns = [
+        "ts_gateway",
+        "factory_id",
+        "machine_id",
+        "device_id",
+        "reading_index",
+        "temperature_c",
+        "raw_x",
+        "raw_y",
+        "raw_z",
+        "x_g",
+        "y_g",
+        "z_g",
+        "vibration_mag_g",
+    ]
+    values = [
+        d["ts_gateway"],
+        d["factory_id"],
+        d["machine_id"],
+        d["device_id"],
+        int(d["reading_index"]),
+        float(d["temperature_c"]),
+        int(d["raw_x"]),
+        int(d["raw_y"]),
+        int(d["raw_z"]),
+        float(d["x_g"]),
+        float(d["y_g"]),
+        float(d["z_g"]),
+        float(d["vibration_mag_g"]),
+    ]
+    if "ts_storage" in TELEMETRY_COLUMNS:
+        columns.append("ts_storage")
+        values.append(d["ts_storage"])
+    columns.append("payload_json")
+    values.append(json.dumps(d, separators=(",", ":")))
+    placeholders = ", ".join(["?"] * len(columns))
     con.execute(
-        """
-        INSERT INTO telemetry_normalized(
-            ts_gateway,
-            factory_id,
-            machine_id,
-            device_id,
-            reading_index,
-            temperature_c,
-            raw_x,
-            raw_y,
-            raw_z,
-            x_g,
-            y_g,
-            z_g,
-            vibration_mag_g,
-            payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            d["ts_gateway"],
-            d["factory_id"],
-            d["machine_id"],
-            d["device_id"],
-            int(d["reading_index"]),
-            float(d["temperature_c"]),
-            int(d["raw_x"]),
-            int(d["raw_y"]),
-            int(d["raw_z"]),
-            float(d["x_g"]),
-            float(d["y_g"]),
-            float(d["z_g"]),
-            float(d["vibration_mag_g"]),
-            json.dumps(d, separators=(",", ":")),
-        ),
+        f"INSERT INTO telemetry_normalized({', '.join(columns)}) VALUES ({placeholders})",
+        tuple(values),
     )
     con.commit()
 

@@ -81,6 +81,31 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def parse_iso_ms(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def diff_ms(start: Optional[str], end: Optional[str]) -> Optional[int]:
+    start_ms = parse_iso_ms(start)
+    end_ms = parse_iso_ms(end)
+    if start_ms is None or end_ms is None:
+        return None
+    return end_ms - start_ms
+
+
 def log(line: str) -> None:
     s = f"{iso_now()} notify {line}"
     print(s, flush=True)
@@ -132,8 +157,96 @@ def ensure_notifications_table(con):
     con.commit()
 
 
+def safe_add_column(con, table_name: str, column_sql: str) -> None:
+    try:
+        con.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+        con.commit()
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e).lower():
+            return
+        raise
+
+
+def table_columns(con, table_name: str):
+    return {row[1] for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def ensure_latency_trace_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS latency_trace (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT,
+          trace_id TEXT,
+          deployment_mode TEXT,
+          factory_id TEXT,
+          machine_id TEXT,
+          device_id TEXT,
+          reading_index INTEGER,
+          window_start_index INTEGER,
+          window_end_index INTEGER,
+          esp_millis INTEGER,
+          ts_ingestion TEXT,
+          ts_storage TEXT,
+          ts_inference TEXT,
+          ts_event TEXT,
+          ts_notification TEXT,
+          ingestion_to_inference_ms INTEGER,
+          inference_to_event_ms INTEGER,
+          event_to_notification_ms INTEGER,
+          end_to_alert_ms INTEGER,
+          ts_publish_client INTEGER,
+          ts_ingestion_received INTEGER,
+          ts_ingestion_published INTEGER,
+          ts_storage_received INTEGER,
+          ts_storage_inserted INTEGER,
+          ts_inference_received INTEGER,
+          ts_inference_start INTEGER,
+          ts_inference_end INTEGER,
+          ts_prediction_published INTEGER,
+          ts_event_received INTEGER,
+          ts_event_created INTEGER,
+          ts_event_published INTEGER,
+          ts_notification_received INTEGER,
+          ts_notification_created INTEGER,
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    con.commit()
+    for column_sql in [
+        "deployment_mode TEXT",
+        "window_start_index INTEGER",
+        "window_end_index INTEGER",
+        "ts_ingestion TEXT",
+        "ts_storage TEXT",
+        "ts_inference TEXT",
+        "ts_event TEXT",
+        "ts_notification TEXT",
+        "ingestion_to_inference_ms INTEGER",
+        "inference_to_event_ms INTEGER",
+        "event_to_notification_ms INTEGER",
+        "end_to_alert_ms INTEGER",
+    ]:
+        safe_add_column(con, "latency_trace", column_sql)
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_latency_trace_run_device_reading
+        ON latency_trace(run_id, device_id, reading_index)
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_latency_trace_trace_id
+        ON latency_trace(trace_id)
+        """
+    )
+    con.commit()
+
+
 con = connect_db()
 ensure_notifications_table(con)
+ensure_latency_trace_table(con)
 log(f"[BOOT] notifications table ensured at {DB_PATH}")
 
 
@@ -194,11 +307,20 @@ def insert_notification_with_retry(
 @dataclass
 class NotificationContext:
     ts_event: str
+    ts_inference: Optional[str]
+    ts_ingestion: Optional[str]
+    ts_storage: Optional[str]
+    ts_gateway: Optional[str]
+    run_id: str
+    deployment_mode: str
+    trace_id: Optional[str]
     incident_id: str
     factory_id: str
     machine_id: str
     device_id: str
     reading_index: int
+    window_start_index: Optional[int]
+    window_end_index: Optional[int]
     severity: str
     anomaly_reason: str
     event_action: str
@@ -259,11 +381,20 @@ class NotificationContext:
 def parse_event_to_context(d: dict) -> NotificationContext:
     return NotificationContext(
         ts_event=d.get("ts_event", iso_now()),
+        ts_inference=d.get("ts_inference"),
+        ts_ingestion=d.get("ts_ingestion"),
+        ts_storage=d.get("ts_storage"),
+        ts_gateway=d.get("ts_gateway"),
+        run_id=d.get("run_id", "manual"),
+        deployment_mode=d.get("deployment_mode", "unknown"),
+        trace_id=d.get("trace_id"),
         incident_id=d.get("incident_id", f"INC-{d.get('device_id', 'unknown')}"),
         factory_id=d.get("factory_id", "unknown"),
         machine_id=d.get("machine_id", "unknown"),
         device_id=d.get("device_id", "unknown"),
         reading_index=int(d.get("reading_index", -1)),
+        window_start_index=int(d["window_start_index"]) if d.get("window_start_index") is not None else None,
+        window_end_index=int(d["window_end_index"]) if d.get("window_end_index") is not None else None,
         severity=d.get("severity", "info"),
         anomaly_reason=d.get("anomaly_reason", "unknown"),
         event_action=d.get("event_action", "UNKNOWN"),
@@ -331,15 +462,65 @@ def audit_delivery(
     provider_msg_id: Optional[str],
 ) -> None:
     status = "DELIVERED" if delivered else "FAILED"
-    insert_notification_with_retry(
+    ts_notification = utc_now_iso()
+    ctx.raw_event["ts_notification"] = ts_notification
+    inserted = insert_notification_with_retry(
         incident_id=ctx.incident_id,
         channel=channel,
         status=status,
         attempt_count=1,
-        delivered_at=ctx.ts_event,
+        delivered_at=ts_notification,
         provider_msg_id=provider_msg_id,
         payload=ctx.raw_event,
     )
+    if inserted:
+        insert_latency_trace_with_retry(ctx, ts_notification)
+
+
+def insert_latency_trace_with_retry(ctx: NotificationContext, ts_notification: str) -> None:
+    # Main latency metric is service-chain latency from ts_ingestion to ts_notification.
+    row = {
+        "run_id": ctx.run_id,
+        "trace_id": ctx.trace_id or f"{ctx.run_id}:{ctx.device_id}:{ctx.reading_index}",
+        "deployment_mode": ctx.deployment_mode,
+        "factory_id": ctx.factory_id,
+        "machine_id": ctx.machine_id,
+        "device_id": ctx.device_id,
+        "reading_index": ctx.reading_index,
+        "window_start_index": ctx.window_start_index,
+        "window_end_index": ctx.window_end_index,
+        "esp_millis": ctx.raw_event.get("espMillis"),
+        "ts_ingestion": ctx.ts_ingestion,
+        "ts_storage": ctx.ts_storage,
+        "ts_inference": ctx.ts_inference,
+        "ts_event": ctx.ts_event,
+        "ts_notification": ts_notification,
+        "ingestion_to_inference_ms": diff_ms(ctx.ts_ingestion, ctx.ts_inference),
+        "inference_to_event_ms": diff_ms(ctx.ts_inference, ctx.ts_event),
+        "event_to_notification_ms": diff_ms(ctx.ts_event, ts_notification),
+        "end_to_alert_ms": diff_ms(ctx.ts_ingestion, ts_notification),
+    }
+    cols_supported = table_columns(con, "latency_trace")
+    cols = [key for key in row.keys() if key in cols_supported]
+    if not cols:
+        return
+    placeholders = ", ".join(["?"] * len(cols))
+    sql = f"INSERT INTO latency_trace({', '.join(cols)}) VALUES ({placeholders})"
+    values = tuple(row[col] for col in cols)
+    for attempt in range(5):
+        try:
+            con.execute(sql, values)
+            con.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < 4:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            log(f"[ERR] insert latency_trace failed: {e}")
+            return
+        except Exception as e:
+            log(f"[ERR] insert latency_trace failed: {e}")
+            return
 
 
 # ============================================================

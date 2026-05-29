@@ -391,6 +391,11 @@ def normalize_window_payload(d: dict) -> dict:
     # Legacy compatibility bridge
     out["ts_gateway"] = d["window_end_ts"]
     out["reading_index"] = int(d["window_end_index"])
+    out.setdefault("run_id", "manual")
+    out.setdefault("deployment_mode", "unknown")
+    out.setdefault("trace_id", f"{out['run_id']}:{out.get('device_id', 'unknown')}:{out['reading_index']}")
+    out.setdefault("ts_ingestion", out.get("window_end_ts_ingestion", out["ts_gateway"]))
+    out.setdefault("espMillis", None)
 
     # Defaults for optional aggregate fields
     out.setdefault("temp_mean", 0.0)
@@ -703,10 +708,18 @@ def on_message(client, userdata, msg):
 
     # Open/update incident only when threshold is first reached
     if is_final == 1 and st["anom_run"] == OPEN_N and not in_cooldown:
+        ts_event = now_iso()
         event_row = {
-            "ts_event": now_iso(),
+            "ts_event": ts_event,
             "ts_inference": d["ts_inference"],
             "ts_gateway": d["ts_gateway"],  # compatibility = window_end_ts
+            # Main latency metric is service-chain latency from ts_ingestion to ts_notification.
+            "ts_ingestion": d.get("ts_ingestion"),
+            "ts_storage": d.get("ts_storage"),
+            "run_id": d.get("run_id", "manual"),
+            "deployment_mode": d.get("deployment_mode", "unknown"),
+            "trace_id": d.get("trace_id"),
+            "espMillis": d.get("espMillis"),
             "factory_id": d["factory_id"],
             "machine_id": d["machine_id"],
             "device_id": d["device_id"],
@@ -744,6 +757,14 @@ def on_message(client, userdata, msg):
 
         downstream = {
             "ts_event": event_row["ts_event"],
+            "ts_inference": d["ts_inference"],
+            "ts_ingestion": d.get("ts_ingestion"),
+            "ts_storage": d.get("ts_storage"),
+            "ts_gateway": d["ts_gateway"],
+            "run_id": d.get("run_id", "manual"),
+            "deployment_mode": d.get("deployment_mode", "unknown"),
+            "trace_id": d.get("trace_id"),
+            "espMillis": d.get("espMillis"),
             "incident_id": incident_id,
             "factory_id": d["factory_id"],
             "machine_id": d["machine_id"],
@@ -792,12 +813,21 @@ def on_message(client, userdata, msg):
             return
 
         if updated > 0:
+            ts_event = now_iso()
             st["cooldown_until"] = datetime.now(timezone.utc) + timedelta(seconds=COOLDOWN_S)
             st["norm_run"] = 0
             st["anom_run"] = 0
 
             downstream = {
-                "ts_event": now_iso(),
+                "ts_event": ts_event,
+                "ts_inference": d["ts_inference"],
+                "ts_ingestion": d.get("ts_ingestion"),
+                "ts_storage": d.get("ts_storage"),
+                "ts_gateway": d["ts_gateway"],
+                "run_id": d.get("run_id", "manual"),
+                "deployment_mode": d.get("deployment_mode", "unknown"),
+                "trace_id": d.get("trace_id"),
+                "espMillis": d.get("espMillis"),
                 "incident_id": incident_id_for(dev),
                 "factory_id": d["factory_id"],
                 "machine_id": d["machine_id"],

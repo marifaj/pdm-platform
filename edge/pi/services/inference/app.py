@@ -5,6 +5,7 @@ import signal
 import sys
 import time
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -128,6 +129,10 @@ def now_ms() -> int:
 
 def now_iso_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def log(message: str) -> None:
@@ -254,6 +259,13 @@ def extract_sample(data: Dict[str, Any]) -> Dict[str, Any]:
         "device_id": device_id,
         "machine_id": machine_id,
         "reading_index": safe_int(data.get("reading_index", data.get("idx")), default=0),
+        "run_id": data.get("run_id", "manual"),
+        "deployment_mode": data.get("deployment_mode", "unknown"),
+        "trace_id": data.get("trace_id"),
+        # ts_ingestion/ts_gateway is service-receive time, not true ESP32 clock time.
+        "ts_ingestion": data.get("ts_ingestion", ts_gateway),
+        "ts_storage": data.get("ts_storage"),
+        "espMillis": data.get("espMillis"),
         "ts_gateway": ts_gateway,
         "temperature_c": temperature_c,
         "x_g": x_g,
@@ -570,13 +582,16 @@ def publish_inference_result(
     last = window_samples[-1]
 
     ts_ms = now_ms()
-    ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000))
+    ts_iso = utc_now_iso()
 
     window_start_ts = first.get("ts_gateway") or ts_iso
     window_end_ts = last.get("ts_gateway") or ts_iso
 
     window_start_index = int(first.get("reading_index") or 0)
     window_end_index = int(last.get("reading_index") or 0)
+    run_id = last.get("run_id") or first.get("run_id") or "manual"
+    deployment_mode = last.get("deployment_mode") or first.get("deployment_mode") or "unknown"
+    trace_id = last.get("trace_id") or f"{run_id}:{device_id}:{window_end_index}"
 
     ml_score = ml_details.get("ml_score")
     if ml_score is None:
@@ -603,6 +618,14 @@ def publish_inference_result(
 
         # Required by event_processing/app.py.
         "ts_inference": ts_iso,
+        "run_id": run_id,
+        "deployment_mode": deployment_mode,
+        "trace_id": trace_id,
+        "ts_ingestion": last.get("ts_ingestion"),
+        "ts_storage": last.get("ts_storage"),
+        "espMillis": last.get("espMillis"),
+        "window_start_ts_ingestion": first.get("ts_ingestion"),
+        "window_end_ts_ingestion": last.get("ts_ingestion"),
         "window_start_ts": window_start_ts,
         "window_end_ts": window_end_ts,
 
