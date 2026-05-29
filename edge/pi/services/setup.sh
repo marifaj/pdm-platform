@@ -7,13 +7,18 @@ cd "$MVA_HOME"
 echo "==> Preparing folders..."
 mkdir -p   "$MVA_HOME/logs"   "$MVA_HOME/tmp"   "$MVA_HOME/data"   "$MVA_HOME/models"   "$MVA_HOME/storage/config"   "$MVA_HOME/pi/services/ingestion"   "$MVA_HOME/pi/services/storage"   "$MVA_HOME/pi/services/inference"   "$MVA_HOME/pi/services/event_processing"   "$MVA_HOME/pi/services/notification"
 
-REQ_FILE="$MVA_HOME/requirements.txt"
+REQ_FILE="$MVA_HOME/pi/requirements.txt"
+if [[ ! -f "$REQ_FILE" ]]; then
+  REQ_FILE="$MVA_HOME/requirements.txt"
+fi
+echo "==> Using requirements file: $REQ_FILE"
 
 if [[ ! -f "$REQ_FILE" ]]; then
   cat > "$REQ_FILE" <<'REQ'
 paho-mqtt==2.1.0
 python-dotenv==1.0.1
 numpy==1.26.4
+pandas==2.2.2
 onnxruntime==1.18.1
 scikit-learn==1.3.2
 skl2onnx==1.16.0
