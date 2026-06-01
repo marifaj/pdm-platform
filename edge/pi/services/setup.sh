@@ -59,12 +59,6 @@ MQTT_USER=
 MQTT_PASS=
 MVA_HOME=$HOME/mva
 
-# ---- topic overrides (optional) ----
-INFERENCE_INPUT_TOPIC=mva/gateway/gw-01/ingestion/normalized
-INFERENCE_OUTPUT_TOPIC=mva/gateway/gw-01/pred/{device_id}
-EVENT_PROC_INPUT_TOPIC=mva/gateway/gw-01/pred/+
-EVENT_PROC_OUTPUT_TOPIC=mva/gateway/gw-01/event/{device_id}
-NOTIFY_INPUT_TOPIC=mva/gateway/gw-01/event/+
 ENV
 fi
 
