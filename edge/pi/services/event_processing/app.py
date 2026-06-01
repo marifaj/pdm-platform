@@ -48,7 +48,7 @@ os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 # LOGGING
 # ============================================================
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def log(msg: str) -> None:
