@@ -1,0 +1,25 @@
+{
+  "device_id": "esp32-002",
+  "input_csv": "/home/marifaj/mva/data/training/train_esp32_002_normal_v2.csv",
+  "model_path": "/home/marifaj/mva/models/if_model_esp32_002.joblib",
+  "window_size": 100,
+  "window_step": 50,
+  "feature_columns": [
+    "temp_mean",
+    "temp_std",
+    "temp_min",
+    "temp_max",
+    "vib_mean",
+    "vib_std",
+    "vib_min",
+    "vib_max"
+  ],
+  "training_rows": 60035,
+  "training_windows": 1199,
+  "training_anomaly_rate": 0.0050041701417848205,
+  "max_consecutive_training_anomaly_windows": 2,
+  "model_type": "IsolationForest",
+  "n_estimators": 100,
+  "contamination": 0.005,
+  "random_state": 42
+}
