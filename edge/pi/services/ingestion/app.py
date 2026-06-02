@@ -14,7 +14,7 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 RUN_ID = os.getenv("RUN_ID", "manual")
 DEPLOYMENT_MODE = os.getenv("DEPLOYMENT_MODE", "unknown")
 
-IN_TOPIC = "factory/+/machine/+/telemetry"
+IN_TOPIC = "mva/raw/telemetry"
 OUT_TOPIC = "mva/normalized/telemetry"
 QUARANTINE_TOPIC = "mva/quarantine/telemetry"
 
