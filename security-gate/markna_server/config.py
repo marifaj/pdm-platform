@@ -41,6 +41,10 @@ class ServerConfig:
     auth_providers: List[str] = field(default_factory=lambda: ["session", "api-token"])
     auth_options: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     session_hours: int = 12
+    #: Credential-guessing budget: this many failures per address (and per
+    #: client address) inside the window before sign-in is refused outright.
+    login_max_failures: int = 8
+    login_window_seconds: int = 900
     #: Set false only for local HTTP development; it drops the Secure cookie flag.
     secure_cookies: bool = True
     #: Extra directories searched for scanner binaries (worker only).
@@ -54,6 +58,10 @@ class ServerConfig:
     worker_workdir: str = "work"
     #: Bytes of report content held in the database per format.
     max_report_bytes: int = 8 * 1024 * 1024
+    #: Hard ceiling on an inbound request body. This API takes small JSON
+    #: documents and form posts; anything larger is refused with 413 before it
+    #: is read into memory.
+    max_request_bytes: int = 1024 * 1024
 
     # ------------------------------------------------------------------ load
 
@@ -84,11 +92,14 @@ class ServerConfig:
             "MARKNA_HOST": ("host", str),
             "MARKNA_PORT": ("port", int),
             "MARKNA_SESSION_HOURS": ("session_hours", int),
+            "MARKNA_LOGIN_MAX_FAILURES": ("login_max_failures", int),
+            "MARKNA_LOGIN_WINDOW_SECONDS": ("login_window_seconds", int),
             "MARKNA_SECURE_COOKIES": ("secure_cookies", _as_bool),
             "MARKNA_OFFLINE": ("offline", _as_bool),
             "MARKNA_AI_ENABLED": ("ai_enabled", _as_bool),
             "MARKNA_AI_MODEL": ("ai_model", str),
             "MARKNA_SCANNER_TIMEOUT": ("scanner_timeout_seconds", int),
+            "MARKNA_MAX_REQUEST_BYTES": ("max_request_bytes", int),
             "MARKNA_WORKER_WORKDIR": ("worker_workdir", str),
         }
         for variable, (attribute, caster) in mapping.items():
@@ -125,6 +136,13 @@ class ServerConfig:
             raise ConfigError(f"unknown report format(s): {', '.join(sorted(unknown))}")
         if not 1 <= self.port <= 65535:
             raise ConfigError(f"port {self.port} is out of range")
+        if self.login_max_failures < 1 or self.login_window_seconds < 1:
+            raise ConfigError(
+                "login_max_failures and login_window_seconds must be positive; throttling "
+                "cannot be switched off by configuration"
+            )
+        if self.max_request_bytes < 1024:
+            raise ConfigError("max_request_bytes must be at least 1024")
 
     # ------------------------------------------------------------- accessors
 

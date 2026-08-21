@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .models import (
     Assessment,
@@ -44,6 +44,29 @@ DEFAULT_REQUIRED_CAPABILITIES: Dict[str, List[str]] = {
     "code": ["sast", "dependency-vulnerabilities", "secrets", "sbom"],
     "environment": ["transport-security", "http-security-headers"],
 }
+
+#: The floor. A policy may *add* required capabilities; it can never remove
+#: these, and a gap in one of them always blocks regardless of severity
+#: configuration or suppressions.
+#:
+#: The floor is deliberately chosen so that it is satisfiable with the
+#: pip-installable scanners alone (bandit or semgrep for `sast`,
+#: detect-secrets or the bundled fallback for `secrets`, and the built-in
+#: architecture and transport engines) — a floor nobody can meet would only
+#: teach operators to route around the gate.
+MANDATORY_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
+    "architecture": ("architecture-review",),
+    "code": ("sast", "secrets"),
+    "environment": ("transport-security",),
+}
+
+#: Severities that always block, whatever `block_on` says. Without this, a
+#: policy of `block_on: []` turns the gate into an unconditional PASS.
+MANDATORY_BLOCK_SEVERITIES: Tuple[Severity, ...] = (Severity.CRITICAL,)
+
+#: Findings carrying this tag are structural gate guarantees: they always
+#: block, and no suppression or severity override can reach them.
+FLOOR_TAG = "gate-floor"
 
 
 @dataclass
@@ -147,8 +170,12 @@ class Policy:
     coverage_gap_severity: Severity = Severity.HIGH
     scanner_error_severity: Severity = Severity.MEDIUM
     max_findings_per_scanner: int = 1000
+    unassessed_layer_severity: Severity = Severity.MEDIUM
     severity_overrides: List[SeverityOverride] = field(default_factory=list)
     suppressions: List[Suppression] = field(default_factory=list)
+    #: Floor adjustments applied when loading. Surfaced as findings so that an
+    #: attempt to weaken the gate is visible in the report rather than silent.
+    floor_corrections: List[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ load
 
@@ -177,6 +204,7 @@ class Policy:
             "required_capabilities",
             "coverage_gap_severity",
             "scanner_error_severity",
+            "unassessed_layer_severity",
             "max_findings_per_scanner",
             "severity_overrides",
             "suppressions",
@@ -188,7 +216,15 @@ class Policy:
         policy.name = str(data.get("name", policy.name))
         policy.description = str(data.get("description", policy.description))
         if "block_on" in data:
-            policy.block_on = _severity_list(data["block_on"], "block_on")
+            requested = _severity_list(data["block_on"], "block_on")
+            missing = [s for s in MANDATORY_BLOCK_SEVERITIES if s not in requested]
+            if missing:
+                policy.floor_corrections.append(
+                    "block_on did not include "
+                    + ", ".join(s.value for s in missing)
+                    + "; the gate floor restored it"
+                )
+            policy.block_on = requested + missing
         if "warn_on" in data:
             policy.warn_on = _severity_list(data["warn_on"], "warn_on")
         if "ai_findings_can_block" in data:
@@ -203,6 +239,9 @@ class Policy:
                 if not isinstance(caps, (list, tuple)):
                     raise PolicyError(f"required_capabilities.{layer_name} must be a list")
             policy.required_capabilities = {k: list(v) for k, v in required.items()}
+            policy.floor_corrections.extend(policy._restore_capability_floor())
+        if "unassessed_layer_severity" in data:
+            policy.unassessed_layer_severity = Severity.parse(data["unassessed_layer_severity"])
         if "coverage_gap_severity" in data:
             policy.coverage_gap_severity = Severity.parse(data["coverage_gap_severity"])
         if "scanner_error_severity" in data:
@@ -228,6 +267,31 @@ class Policy:
         ]
         return policy
 
+    # ------------------------------------------------------------------ floor
+
+    def _restore_capability_floor(self) -> List[str]:
+        """Put back any mandatory capability the policy tried to drop.
+
+        Returns a human-readable note per correction. The policy is free to
+        require *more* than the floor; it cannot require less, and any attempt
+        is recorded rather than silently accepted.
+        """
+        corrections: List[str] = []
+        for layer, mandatory in MANDATORY_CAPABILITIES.items():
+            configured = list(self.required_capabilities.get(layer, []))
+            missing = [name for name in mandatory if name not in configured]
+            if not missing:
+                continue
+            corrections.append(
+                f"required_capabilities.{layer} omitted {', '.join(missing)}; "
+                "the gate floor restored it"
+            )
+            self.required_capabilities[layer] = configured + missing
+        return corrections
+
+    def mandatory_for(self, layer: Layer) -> Tuple[str, ...]:
+        return MANDATORY_CAPABILITIES.get(layer.value, ())
+
     # ------------------------------------------------------------------ apply
 
     def apply(self, assessment: Assessment) -> Assessment:
@@ -241,9 +305,16 @@ class Policy:
         assessment.coverage = self._evaluate_coverage(assessment)
         assessment.findings.extend(self._coverage_findings(assessment))
         assessment.findings.extend(self._scanner_error_findings(assessment))
+        assessment.findings.extend(self._unassessed_layer_findings(assessment))
+        assessment.findings.extend(self._floor_correction_findings(assessment))
 
         assign_ids(assessment.findings)
         for finding in assessment.findings:
+            # Coverage and scanner-error findings are policy-controlled like any
+            # other, except for the floor findings, which `_apply_overrides` and
+            # `_apply_suppressions` refuse to touch.
+            self._apply_overrides(finding)
+            self._apply_suppressions(finding)
             if not finding.suppressed:
                 finding.blocking = self._is_blocking(finding)
 
@@ -255,6 +326,8 @@ class Policy:
     # ------------------------------------------------------------- internals
 
     def _apply_overrides(self, finding: Finding) -> None:
+        if FLOOR_TAG in finding.tags:
+            return  # structural gate guarantees are not re-rateable
         for override in self.severity_overrides:
             if override.match.matches(finding):
                 if finding.severity is not override.severity:
@@ -267,11 +340,16 @@ class Policy:
                 return
 
     def _apply_suppressions(self, finding: Finding) -> None:
+        if FLOOR_TAG in finding.tags:
+            # A policy that could suppress its own coverage gaps would be a
+            # policy that can switch the gate off. It cannot.
+            return
         for suppression in self.suppressions:
             if not suppression.match.matches(finding):
                 continue
             if not suppression.active():
-                finding.tags.append("suppression-expired")
+                if "suppression-expired" not in finding.tags:
+                    finding.tags.append("suppression-expired")
                 continue
             finding.suppressed = True
             finding.suppression_reason = suppression.reason
@@ -281,6 +359,9 @@ class Policy:
     def _is_blocking(self, finding: Finding) -> bool:
         if finding.suppressed:
             return False
+        if FLOOR_TAG in finding.tags:
+            # Independent of block_on, of severity overrides and of suppressions.
+            return True
         if finding.ai_generated and not self.ai_findings_can_block:
             return False
         return finding.severity in self.block_on
@@ -314,6 +395,7 @@ class Policy:
         for entry in assessment.coverage:
             if entry.satisfied:
                 continue
+            mandatory = entry.capability in self.mandatory_for(entry.layer)
             attempts = [
                 run
                 for run in assessment.runs
@@ -339,14 +421,78 @@ class Policy:
                     location=Location(component=f"{entry.layer.value}/{entry.capability}"),
                     remediation=(
                         "Install or enable a scanner providing this capability (see "
-                        "'markna scanners' for the registry and installation hints), or relax the "
-                        "requirement explicitly in the policy file so the gap is a recorded decision."
+                        "'markna scanners' for the registry and installation hints)."
+                        + (
+                            " This capability is part of the mandatory gate floor: it cannot be "
+                            "removed by policy, and the gate cannot return PASS without it."
+                            if mandatory
+                            else " Alternatively, relax the requirement explicitly in the policy "
+                            "file so the gap is a recorded decision."
+                        )
                     ),
                     rule_id=f"coverage/{entry.layer.value}/{entry.capability}",
-                    tags=["coverage-gap"],
+                    tags=["coverage-gap"] + ([FLOOR_TAG] if mandatory else []),
                 )
             )
         return findings
+
+    def _unassessed_layer_findings(self, assessment: Assessment) -> List[Finding]:
+        """Surface layers the target was configured for but that were not run.
+
+        Selecting a subset of layers is legitimate, but it must never be
+        invisible: an unassessed layer is an unexamined layer, and the report
+        has to say so next to the verdict.
+        """
+        available = set(assessment.layers_available or assessment.layers_requested)
+        skipped = [layer for layer in Layer if layer in available and layer not in assessment.layers_requested]
+        return [
+            Finding(
+                source="markna:coverage",
+                layer=layer,
+                severity=self.unassessed_layer_severity,
+                title=f"The {layer.value} layer was configured for this target but not assessed",
+                explanation=(
+                    f"This target has the inputs needed to assess the {layer.value} layer, but the "
+                    "run did not include it. No conclusion in this report covers that layer, and "
+                    "the verdict must not be read as if it did."
+                ),
+                evidence=(
+                    "assessed: " + ", ".join(sorted(l.value for l in assessment.layers_requested))
+                    + "\navailable: " + ", ".join(sorted(l.value for l in available))
+                ),
+                location=Location(component=f"layers/{layer.value}"),
+                remediation=f"Re-run the gate including the {layer.value} layer before release.",
+                rule_id=f"coverage/layer-not-assessed/{layer.value}",
+                tags=["coverage-gap", "layer-not-assessed"],
+            )
+            for layer in skipped
+        ]
+
+    def _floor_correction_findings(self, assessment: Assessment) -> List[Finding]:
+        """Record any attempt by the policy to drop below the gate floor."""
+        if not self.floor_corrections:
+            return []
+        return [
+            Finding(
+                source="markna:policy",
+                layer=Layer.CODE,
+                severity=Severity.HIGH,
+                title="Policy attempted to weaken the mandatory gate floor",
+                explanation=(
+                    f"Policy '{self.name}' configured the gate below the floor MARKNA enforces. "
+                    "The floor was restored for this run; the policy document should be corrected "
+                    "so the discrepancy between what it says and what it does disappears."
+                ),
+                evidence="\n".join(f"- {note}" for note in self.floor_corrections),
+                location=Location(component="policy"),
+                remediation=(
+                    "Remove the weakened settings from the policy, or state the risk acceptance "
+                    "explicitly through a suppression that names the individual finding."
+                ),
+                rule_id="policy/floor-restored",
+                tags=["policy", FLOOR_TAG],
+            )
+        ]
 
     def _scanner_error_findings(self, assessment: Assessment) -> List[Finding]:
         findings: List[Finding] = []
@@ -380,6 +526,13 @@ class Policy:
         blocking = [f for f in active if f.blocking]
         reasons: List[str] = []
 
+        mandatory = [
+            entry
+            for entry in assessment.coverage
+            if entry.capability in self.mandatory_for(entry.layer)
+        ]
+        satisfied = [entry for entry in mandatory if entry.satisfied]
+
         if blocking:
             by_sev: Dict[str, int] = {}
             for finding in blocking:
@@ -388,6 +541,21 @@ class Policy:
             reasons.append(f"{len(blocking)} blocking finding(s): {summary}.")
             reasons.append(f"Blocking severities under policy '{self.name}': "
                            f"{', '.join(s.value for s in self.block_on)}.")
+            reasons.append(
+                f"Mandatory capabilities evaluated: {len(satisfied)}/{len(mandatory)}."
+            )
+            return Verdict.BLOCK, reasons
+
+        if not mandatory:
+            # The structural guarantee: a run that required nothing proves
+            # nothing, so it cannot be reported as a pass.
+            reasons.append(
+                "No mandatory capability was evaluated for any assessed layer, so this run "
+                "establishes nothing about the target."
+            )
+            reasons.append(
+                "PASS is unreachable without mandatory coverage; see MANDATORY_CAPABILITIES."
+            )
             return Verdict.BLOCK, reasons
 
         warn_severities = set(self.warn_on) | set(self.block_on)
@@ -400,13 +568,21 @@ class Policy:
                     f"{len(advisory)} of them are AI advisory findings, which cannot block under "
                     "this policy and require human triage."
                 )
+            reasons.append(
+                f"Mandatory capabilities evaluated: {len(satisfied)}/{len(mandatory)}."
+            )
             return Verdict.WARN, reasons
 
         reasons.append("No findings at or above the warn threshold.")
-        satisfied = [entry for entry in assessment.coverage if entry.satisfied]
+        covered = [entry for entry in assessment.coverage if entry.satisfied]
         reasons.append(
-            f"{len(satisfied)}/{len(assessment.coverage)} required deterministic capabilities were "
-            "covered."
+            f"{len(covered)}/{len(assessment.coverage)} required deterministic capabilities were "
+            f"covered, including all {len(mandatory)} mandatory one(s)."
+        )
+        reasons.append(
+            "Layers assessed: "
+            + ", ".join(sorted(layer.value for layer in assessment.layers_requested))
+            + "."
         )
         return Verdict.PASS, reasons
 
@@ -419,6 +595,9 @@ class Policy:
             "ai_findings_can_block": self.ai_findings_can_block,
             "required_capabilities": {k: list(v) for k, v in self.required_capabilities.items()},
             "coverage_gap_severity": self.coverage_gap_severity.value,
+            "unassessed_layer_severity": self.unassessed_layer_severity.value,
+            "mandatory_capabilities": {k: list(v) for k, v in MANDATORY_CAPABILITIES.items()},
+            "floor_corrections": list(self.floor_corrections),
             "scanner_error_severity": self.scanner_error_severity.value,
             "max_findings_per_scanner": self.max_findings_per_scanner,
         }

@@ -186,24 +186,22 @@ class TestAuthService:
     def test_login_rejects_a_wrong_password(self, services, organization):
         make_user(services, organization, email="p@example.com", password="correct-horse-battery")
         with pytest.raises(ValidationError, match="invalid email or password"):
-            services.auth.login(organization.id, "p@example.com", "wrong-password-here")
+            services.auth.login("p@example.com", "wrong-password-here")
 
     def test_login_rejects_an_unknown_user_with_the_same_message(self, services, organization):
         with pytest.raises(ValidationError, match="invalid email or password"):
-            services.auth.login(organization.id, "nobody@example.com", "whatever-password")
+            services.auth.login("nobody@example.com", "whatever-password")
 
     def test_login_creates_a_session_and_records_it(self, services, organization):
         make_user(services, organization, email="p@example.com", password="correct-horse-battery")
-        user, session = services.auth.login(
-            organization.id, "p@example.com", "correct-horse-battery"
-        )
+        user, session = services.auth.login("p@example.com", "correct-horse-battery")
         assert services.uow.identity.get_session(session.id) is not None
         assert user.last_login_at is not None
         assert any(event.action == "auth.login" for event in services.uow.audit.list(user.to_principal("x").scope))
 
     def test_logout_destroys_the_session(self, services, organization):
         make_user(services, organization, email="p@example.com", password="correct-horse-battery")
-        _, session = services.auth.login(organization.id, "p@example.com", "correct-horse-battery")
+        _, session = services.auth.login("p@example.com", "correct-horse-battery")
         services.auth.logout(session.id)
         assert services.uow.identity.get_session(session.id) is None
 

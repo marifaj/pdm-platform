@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .authorization import Authorization, AuthorizationError, Scope, ScopeError
+from .confinement import confine_findings, escaping_symlink_finding, find_escaping_symlinks
 from .exec import ToolPath, run_command
 from .http import HttpClient
 from .models import (
@@ -45,6 +46,10 @@ class RunConfig:
     architecture_manifest_path: Optional[Path] = None
     target_url: Optional[str] = None
     layers: List[Layer] = field(default_factory=list)
+    #: Every layer the target has inputs for. Defaults to `layers`; when the
+    #: caller knows more (the server does), the difference is reported as an
+    #: unassessed-layer finding rather than passing silently.
+    available_layers: List[Layer] = field(default_factory=list)
     authorization: Optional[Authorization] = None
     policy: Policy = field(default_factory=Policy)
     workdir: Path = Path(".markna")
@@ -81,8 +86,11 @@ class Runner:
             policy_name=config.policy.name,
             started_at=utc_now(),
             layers_requested=list(config.layers),
+            layers_available=list(config.available_layers or config.layers),
             tool_version=__version__,
         )
+
+        assessment.findings.extend(self._confinement_findings())
 
         deterministic, cross_layer = self._select_scanners()
         for scanner in deterministic:
@@ -104,6 +112,18 @@ class Runner:
         config.policy.apply(assessment)
         self.progress("verdict", f"{assessment.verdict.value}")
         return assessment
+
+    def _confinement_findings(self) -> List[Any]:
+        """Report symlinks that leave the project before anything reads them."""
+        if Layer.CODE not in self.config.layers or not self.config.project_path:
+            return []
+        escaping = find_escaping_symlinks(self.config.project_path)
+        if not escaping:
+            return []
+        self.progress(
+            "warn", f"repository contains {len(escaping)} symlink(s) leaving the project root"
+        )
+        return [escaping_symlink_finding(self.config.project_path, escaping)]
 
     # ------------------------------------------------------------------ context
 
@@ -262,6 +282,10 @@ class Runner:
 
         run.duration_seconds = time.monotonic() - started
         run.command = "; ".join(context.commands) or None
+        # A scanner may follow a symlink out of the repository. It does not get
+        # to put what it found there into the report.
+        if scanner.layer is Layer.CODE:
+            findings = confine_findings(findings, self.config.project_path)
         findings = cap_findings(
             findings, self.config.policy.max_findings_per_scanner, scanner.name
         )

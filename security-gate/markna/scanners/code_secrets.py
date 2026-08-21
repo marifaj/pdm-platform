@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from ..confinement import iter_safe_files
 from ..exec import probe_version
 from ..models import Finding, Layer, Location, Severity
 from ..redact import clean_evidence, redact
@@ -226,7 +227,7 @@ class DetectSecretsScanner(Scanner):
                                     [
                                         f"detector: {detector}",
                                         f"sha1(secret): {entry.get('hashed_secret', '')}",
-                                        read_snippet(absolute, line, line),
+                                        read_snippet(absolute, line, line, root=project),
                                     ],
                                 )
                             )
@@ -308,11 +309,10 @@ class BuiltinSecretsScanner(Scanner):
 
         findings: List[Finding] = [self._coverage_notice()]
         seen: set = set()
-        for path in sorted(project.rglob("*")):
-            if not path.is_file():
-                continue
-            if any(part in excludes for part in path.relative_to(project).parts):
-                continue
+        # iter_safe_files never descends a directory symlink and never yields a
+        # file whose target resolves outside the project: the repository under
+        # assessment does not get to choose what this scanner reads.
+        for path in iter_safe_files(project, skip_directories=excludes):
             if path.suffix.lower() not in _FALLBACK_TEXT_SUFFIXES:
                 continue
             try:

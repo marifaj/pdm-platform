@@ -328,6 +328,7 @@ def _build_run_config(args: argparse.Namespace, file_config: Dict[str, Any]) -> 
 
     authorization = _build_authorization(args, environment)
     layers = _resolve_layers(args, file_config, project_path, documents, manifest, url)
+    available = _available_layers(project_path, documents, manifest, url)
 
     policy_path = args.policy or file_config.get("policy")
     policy = Policy.load(policy_path)
@@ -347,6 +348,7 @@ def _build_run_config(args: argparse.Namespace, file_config: Dict[str, Any]) -> 
         architecture_manifest_path=manifest,
         target_url=url,
         layers=layers,
+        available_layers=available,
         authorization=authorization,
         policy=policy,
         workdir=Path(args.workdir).resolve(),
@@ -378,6 +380,23 @@ def _build_authorization(
         or bool(from_file.get("allow_private_targets", False)),
     }
     return Authorization.from_dict(data)
+
+
+def _available_layers(
+    project_path: Optional[Path],
+    documents: List[Path],
+    manifest: Optional[Path],
+    url: Optional[str],
+) -> List[Layer]:
+    """Every layer this invocation had the inputs for, requested or not."""
+    available: List[Layer] = []
+    if documents or manifest:
+        available.append(Layer.ARCHITECTURE)
+    if project_path:
+        available.append(Layer.CODE)
+    if url:
+        available.append(Layer.ENVIRONMENT)
+    return available
 
 
 def _resolve_layers(

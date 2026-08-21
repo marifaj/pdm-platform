@@ -249,7 +249,10 @@ def list_tokens(ctx: Context) -> Response:
 def create_token(ctx: Context) -> Response:
     body = ctx.request.json()
     token, secret = ctx.services.auth.issue_api_token(
-        ctx.user, _required(body, "name"), expires_at=body.get("expires_at")
+        ctx.user,
+        _required(body, "name"),
+        roles=body.get("roles"),
+        expires_at=body.get("expires_at"),
     )
     payload = serializers.api_token(token)
     # The only time the plaintext exists outside the caller's hands.

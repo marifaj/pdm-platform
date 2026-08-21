@@ -125,8 +125,7 @@ class CheckovScanner(Scanner):
                 + (f"See {guideline}" if guideline else "")
             ).strip(),
             evidence=clean_evidence(
-                read_snippet(absolute, start_line, end_line)
-                or str(check.get("code_block", ""))[:2000]
+                read_snippet(absolute, start_line, end_line, root=project) or ""
             ),
             location=Location(
                 file=rel_path,

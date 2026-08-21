@@ -129,6 +129,30 @@ class Scope:
                 "Set authorization.allow_private_targets when assessing an internal UAT host."
             )
 
+    def address_allowed(self, address: str) -> bool:
+        """Is this *resolved IP* one the scope permits?
+
+        Checked immediately before the socket connects, on the exact address
+        the socket will use. The hostname check in :meth:`check` happens before
+        name resolution and can therefore be defeated by a name that answers
+        differently the second time it is resolved; this cannot.
+        """
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if self.allow_private:
+            return True
+        return not _is_private_address(parsed)
+
+    def require_address(self, host: str, address: str) -> None:
+        if not self.address_allowed(address):
+            raise ScopeError(
+                f"host '{host}' resolved to {address}, which is a private, loopback or "
+                "otherwise non-public address. Set authorization.allow_private_targets when "
+                "assessing an internal UAT host."
+            )
+
     def allows(self, url: str) -> bool:
         try:
             self.check(url)

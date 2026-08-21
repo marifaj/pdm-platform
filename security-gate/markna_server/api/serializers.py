@@ -196,6 +196,7 @@ def api_token(entity: ApiToken) -> Dict[str, Any]:
         "id": entity.id,
         "name": entity.name,
         "user_id": entity.user_id,
+        "roles": sorted(role.value for role in entity.roles),
         "created_at": entity.created_at,
         "expires_at": entity.expires_at,
         "last_used_at": entity.last_used_at,

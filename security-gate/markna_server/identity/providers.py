@@ -27,7 +27,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence
 
 from .credentials import ApiToken, Session
 from .passwords import hash_api_token
-from .principal import Principal, User
+from .principal import Principal, User, permissions_for
 
 SESSION_COOKIE = "markna_session"
 
@@ -127,9 +127,27 @@ class ApiTokenProvider(_BaseProvider):
         if token is None or not token.is_usable:
             return None
         principal = self._principal_for(self.store.get_user(token.user_id), self.name, service=True)
-        if principal is not None:
-            self.store.touch_api_token(token.id)
-        return principal
+        if principal is None:
+            return None
+
+        # The token carries its own roles, but never more than its owner holds
+        # *now*: demoting the user invalidates their over-privileged tokens on
+        # the next request, without having to hunt them down. Fails closed —
+        # a token that outgrew its owner stops working rather than narrowing.
+        effective = frozenset(token.roles)
+        if not effective or permissions_for(effective) - principal.permissions:
+            return None
+        self.store.touch_api_token(token.id)
+        return Principal(
+            id=principal.id,
+            organization_id=principal.organization_id,
+            display_name=f"{principal.display_name} (token: {token.name})",
+            roles=effective,
+            email=principal.email,
+            auth_method=self.name,
+            subject=principal.subject,
+            is_service=True,
+        )
 
     def challenge(self, request: AuthRequest) -> Optional[Challenge]:
         return Challenge(status=401, headers={"WWW-Authenticate": 'Bearer realm="markna"'})

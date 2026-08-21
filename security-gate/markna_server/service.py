@@ -14,6 +14,7 @@ or from the web UI. Two consequences worth stating explicitly:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from markna.models import Layer, Verdict, utc_now
@@ -28,12 +29,14 @@ from .domain import (
     EnvironmentKind,
     EnvironmentTarget,
     FindingRecord,
+    DomainError,
     NotFound,
     Organization,
     Policy,
     Project,
     ReportArtifact,
     RunStatus,
+    PermissionDenied,
     RunTrigger,
     ScannerRunRecord,
     SourceRepository,
@@ -52,10 +55,48 @@ from .identity import (
     expiry_from_now,
     generate_api_token,
     hash_api_token,
+    permissions_for,
     hash_password,
     verify_password,
 )
 from .storage import UnitOfWork
+
+
+class TooManyAttempts(DomainError):
+    """Raised when credential guessing is being throttled."""
+
+    status = 429
+    code = "too_many_attempts"
+
+
+_DECOY_HASH: Optional[str] = None
+
+
+def _decoy_password_hash() -> str:
+    """A real hash to verify against when no account matched.
+
+    Computed once, then reused: the point is to spend the same CPU as a genuine
+    verification, not to be secret.
+    """
+    global _DECOY_HASH
+    if _DECOY_HASH is None:
+        _DECOY_HASH = hash_password("markna-decoy-password-value")
+    return _DECOY_HASH
+
+
+def _window_start(seconds: int) -> str:
+    moment = datetime.now(timezone.utc) - timedelta(seconds=max(1, seconds))
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_role_names(names: Sequence[str]) -> set:
+    parsed = set()
+    for name in names or []:
+        try:
+            parsed.add(Role(str(name).strip().lower()))
+        except ValueError as exc:
+            raise ValidationError(f"unknown role: {name!r}") from exc
+    return parsed
 
 
 @dataclass
@@ -609,14 +650,62 @@ class AuthService(_Service):
     """
 
     def login(
-        self, organization_id: str, email: str, password: str, *, user_agent: str = ""
+        self,
+        email: str,
+        password: str,
+        *,
+        organization_slug: Optional[str] = None,
+        user_agent: str = "",
+        client_key: str = "",
     ) -> Tuple[User, Session]:
-        user = self.uow.identity.find_user_by_email(organization_id, email)
-        if user is None or not user.is_active or not user.password_hash:
-            raise ValidationError("invalid email or password")
-        if not verify_password(password, user.password_hash):
-            raise ValidationError("invalid email or password")
+        """Authenticate by address, across every organisation in the deployment.
 
+        Three properties this has to hold at once:
+
+        * **No singleton assumption.** The caller supplies an address, not an
+          organisation. Accounts are found across tenants and the matching one
+          decides the scope.
+        * **Constant work on failure.** An unknown address costs the same
+          password verification as a known one, so response time does not
+          disclose whether an account exists.
+        * **Bounded guessing.** Failures are counted per address and per client;
+          past the threshold the attempt is refused before any verification.
+        """
+        email = (email or "").strip().lower()
+        self._enforce_login_throttle(email, client_key)
+
+        candidates = self.uow.identity.find_users_by_email(email)
+        if organization_slug:
+            organization = self.uow.organizations.get_by_slug(organization_slug.strip().lower())
+            candidates = [
+                user for user in candidates
+                if organization is not None and user.organization_id == organization.id
+            ]
+        usable = [user for user in candidates if user.is_active and user.password_hash]
+
+        # Verify against every candidate, and against a decoy when there are
+        # none, so the work done is the same either way.
+        matches = [user for user in usable if verify_password(password, user.password_hash or "")]
+        if not usable:
+            verify_password(password, _decoy_password_hash())
+
+        if not matches:
+            self._record_login_failure(email, client_key)
+            raise ValidationError("invalid email or password")
+        if len(matches) > 1:
+            # Only reachable by someone who already proved the password in more
+            # than one organisation, so naming the ambiguity discloses nothing.
+            raise ValidationError(
+                "this address is valid in more than one organization; sign in with the "
+                "organization slug as well"
+            )
+
+        user = matches[0]
+        # Clear the per-address counter only. Clearing the per-client counter
+        # would let an attacker who holds one valid account reset the budget it
+        # is spending against every other address.
+        self.uow.identity.clear_auth_failures(f"email:{email}")
+        self.uow.identity.record_auth_attempt(f"email:{email}", successful=True)
         session = self.uow.identity.create_session(
             Session(
                 organization_id=user.organization_id,
@@ -639,6 +728,23 @@ class AuthService(_Service):
             )
         )
         return user, session
+
+    # -- throttling --------------------------------------------------------
+
+    def _enforce_login_throttle(self, email: str, client_key: str) -> None:
+        since = _window_start(self.config.login_window_seconds)
+        limit = self.config.login_max_failures
+        for key in filter(None, (f"email:{email}", f"client:{client_key}" if client_key else "")):
+            if self.uow.identity.count_recent_auth_failures(key, since) >= limit:
+                raise TooManyAttempts(
+                    "too many failed sign-in attempts; wait "
+                    f"{self.config.login_window_seconds // 60} minutes and try again"
+                )
+
+    def _record_login_failure(self, email: str, client_key: str) -> None:
+        self.uow.identity.record_auth_attempt(f"email:{email}", successful=False)
+        if client_key:
+            self.uow.identity.record_auth_attempt(f"client:{client_key}", successful=False)
 
     def logout(self, session_id: str) -> None:
         self.uow.identity.delete_session(session_id)
@@ -671,32 +777,72 @@ class AuthService(_Service):
         return self.uow.identity.list_users(scope)
 
     def issue_api_token(
-        self, principal: Principal, name: str, *, expires_at: Optional[str] = None
+        self,
+        principal: Principal,
+        name: str,
+        *,
+        roles: Optional[Sequence[str]] = None,
+        expires_at: Optional[str] = None,
     ) -> Tuple[ApiToken, str]:
-        """Create a token. The plaintext is returned once and never stored."""
-        scope = self.access.require(principal, Permission.TOKEN_MANAGE)
+        """Create a token. The plaintext is returned once and never stored.
+
+        A token is a credential that outlives the session that made it, so it
+        gets its own explicit roles — and those can never exceed the issuer's.
+        A viewer can mint a read-only token for CI; nobody can mint a token that
+        is more powerful than themselves.
+        """
+        scope = self.access.require(principal, Permission.TOKEN_CREATE)
+        requested = _parse_role_names(roles) if roles is not None else set(principal.roles)
+        # Compared on permissions, not role names: a maintainer legitimately
+        # mints a viewer token even though it does not hold the "viewer" label.
+        excessive = permissions_for(requested) - principal.permissions
+        if excessive:
+            raise PermissionDenied(
+                "a token cannot be granted privileges its issuer does not hold: "
+                + ", ".join(sorted(permission.value for permission in excessive)),
+                detail={"requested": sorted(role.value for role in requested)},
+            )
+        if not requested:
+            raise ValidationError("a token needs at least one role")
+
         secret = generate_api_token()
         token = ApiToken(
             organization_id=scope.organization_id,
             user_id=principal.id,
             name=name,
+            roles=requested,
             token_hash=hash_api_token(secret),
             expires_at=expires_at,
         )
         self.uow.identity.create_api_token(token)
-        self._audit(principal, "token.create", "token", token.id, {"name": name})
+        self._audit(
+            principal,
+            "token.create",
+            "token",
+            token.id,
+            {"name": name, "roles": sorted(role.value for role in requested)},
+        )
         return token, secret
 
     def revoke_api_token(self, principal: Principal, token_id: str) -> bool:
-        scope = self.access.require(principal, Permission.TOKEN_MANAGE)
+        scope = self.access.require(principal, Permission.TOKEN_CREATE)
+        if not principal.has(Permission.TOKEN_MANAGE):
+            owned = {token.id for token in self.uow.identity.list_api_tokens(scope)
+                     if token.user_id == principal.id}
+            if token_id not in owned:
+                raise PermissionDenied("only an administrator may revoke another user's token")
         revoked = self.uow.identity.revoke_api_token(scope, token_id)
         if revoked:
             self._audit(principal, "token.revoke", "token", token_id)
         return revoked
 
     def list_api_tokens(self, principal: Principal) -> List[ApiToken]:
-        scope = self.access.require(principal, Permission.TOKEN_MANAGE)
-        return self.uow.identity.list_api_tokens(scope)
+        """Administrators see the organisation's tokens; everyone else sees theirs."""
+        scope = self.access.require(principal, Permission.TOKEN_CREATE)
+        tokens = self.uow.identity.list_api_tokens(scope)
+        if principal.has(Permission.TOKEN_MANAGE):
+            return tokens
+        return [token for token in tokens if token.user_id == principal.id]
 
 
 # ------------------------------------------------------------------ container

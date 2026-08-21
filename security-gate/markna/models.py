@@ -359,6 +359,9 @@ class Assessment:
     verdict: Verdict = Verdict.PASS
     verdict_reasons: List[str] = field(default_factory=list)
     layers_requested: List[Layer] = field(default_factory=list)
+    #: Layers the target had the inputs for, whether or not they were run. The
+    #: difference against layers_requested is reported, never left implicit.
+    layers_available: List[Layer] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     runs: List[ScannerRun] = field(default_factory=list)
     coverage: List[CoverageEntry] = field(default_factory=list)
@@ -392,6 +395,11 @@ class Assessment:
             "finished_at": self.finished_at,
             "target": self.target.to_dict(),
             "layers": [layer.value for layer in self.layers_requested],
+            "layers_available": [layer.value for layer in self.layers_available],
+            "layers_not_assessed": sorted(
+                layer.value
+                for layer in (set(self.layers_available) - set(self.layers_requested))
+            ),
             "verdict": self.verdict.value,
             "verdict_reasons": list(self.verdict_reasons),
             "summary": {

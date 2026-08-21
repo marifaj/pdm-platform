@@ -128,7 +128,7 @@ class SemgrepScanner(Scanner):
                 severity = Severity.CRITICAL
 
         absolute = project / rel_path if rel_path else None
-        snippet = read_snippet(absolute, start_line, end_line)
+        snippet = read_snippet(absolute, start_line, end_line, root=project)
         evidence = snippet or str(extra.get("lines", "")).strip()
 
         owasp = ", ".join(str(entry) for entry in _as_list(metadata.get("owasp")))

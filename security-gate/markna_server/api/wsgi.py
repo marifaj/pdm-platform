@@ -26,6 +26,16 @@ from ..identity import AuthRequest, Principal
 
 Handler = Callable[..., "Response"]
 
+#: Default ceiling on a request body. Overridden from ServerConfig.
+DEFAULT_MAX_BODY_BYTES = 1024 * 1024
+
+#: Methods that change state and therefore need CSRF protection when the caller
+#: is authenticated by an ambient credential (a cookie).
+STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: Header a browser client must send with a session-authenticated API call.
+CSRF_HEADER = "x-markna-csrf"
+
 #: Locked down hard: the UI ships its own CSS inline and runs no JavaScript.
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -53,7 +63,15 @@ class Request:
     params: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_environ(cls, environ: Dict[str, Any]) -> "Request":
+    def from_environ(
+        cls, environ: Dict[str, Any], *, max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    ) -> "Request":
+        """Build a request, refusing anything malformed.
+
+        Raises :class:`BadRequest` or :class:`PayloadTooLarge`; the caller runs
+        this inside the error boundary so a hostile Content-Length produces a
+        clean 400 rather than an unhandled exception escaping the WSGI callable.
+        """
         headers = {
             key[5:].replace("_", "-").lower(): value
             for key, value in environ.items()
@@ -63,9 +81,7 @@ class Request:
             if environ.get(key):
                 headers[header] = environ[key]
 
-        length = int(environ.get("CONTENT_LENGTH") or 0)
-        # Bound the body: this API accepts small JSON documents, never uploads.
-        body = environ["wsgi.input"].read(min(length, 4 * 1024 * 1024)) if length else b""
+        body = cls._read_body(environ, max_body_bytes)
 
         cookies: Dict[str, str] = {}
         if headers.get("cookie"):
@@ -83,6 +99,37 @@ class Request:
             remote_addr=environ.get("REMOTE_ADDR", ""),
         )
 
+    @staticmethod
+    def _read_body(environ: Dict[str, Any], max_body_bytes: int) -> bytes:
+        """Read at most ``max_body_bytes``, and only for a sane Content-Length.
+
+        A negative or non-numeric length is a protocol error, not something to
+        coerce: `read(-1)` would drain the socket and defeat the limit entirely.
+        """
+        raw_length = environ.get("CONTENT_LENGTH")
+        if raw_length in (None, ""):
+            return b""
+        try:
+            length = int(str(raw_length).strip())
+        except (TypeError, ValueError):
+            raise BadRequest(f"malformed Content-Length: {raw_length!r}")
+        if length < 0:
+            raise BadRequest(f"negative Content-Length: {length}")
+        if length > max_body_bytes:
+            raise PayloadTooLarge(
+                f"request body of {length} bytes exceeds the {max_body_bytes}-byte limit"
+            )
+        stream = environ.get("wsgi.input")
+        if stream is None:
+            return b""
+        # Read one byte past the ceiling so a lying Content-Length is caught too.
+        body = stream.read(min(length, max_body_bytes) + 1)
+        if len(body) > max_body_bytes:
+            raise PayloadTooLarge(
+                f"request body exceeded the {max_body_bytes}-byte limit"
+            )
+        return body
+
     # -- accessors ---------------------------------------------------------
 
     def get(self, name: str, default: str = "") -> str:
@@ -98,7 +145,23 @@ class Request:
     def get_bool(self, name: str) -> bool:
         return self.get(name, "").lower() in ("1", "true", "yes", "on")
 
-    def json(self) -> Dict[str, Any]:
+    def json(self, *, require_content_type: bool = True) -> Dict[str, Any]:
+        """Parse a JSON body, requiring the caller to declare it as JSON.
+
+        Requiring the content type is a CSRF control as much as a correctness
+        one: a cross-site form post cannot set `application/json` without
+        triggering a CORS preflight, so this closes the simple-request shape.
+        """
+        if require_content_type:
+            declared = self.headers.get("content-type", "").split(";")[0].strip().lower()
+            if declared and declared != "application/json":
+                raise UnsupportedMediaType(
+                    f"this endpoint requires Content-Type: application/json, got {declared!r}"
+                )
+            if not declared and self.body:
+                raise UnsupportedMediaType(
+                    "this endpoint requires Content-Type: application/json"
+                )
         if not self.body:
             return {}
         try:
@@ -163,6 +226,21 @@ class Context:
 class BadRequest(DomainError):
     status = 400
     code = "bad_request"
+
+
+class PayloadTooLarge(DomainError):
+    status = 413
+    code = "payload_too_large"
+
+
+class UnsupportedMediaType(DomainError):
+    status = 415
+    code = "unsupported_media_type"
+
+
+class CsrfError(DomainError):
+    status = 403
+    code = "csrf_failed"
 
 
 @dataclass

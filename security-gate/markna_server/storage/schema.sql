@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name            TEXT NOT NULL,
+    -- The token's own roles. Always a subset of the issuer's roles at creation
+    -- time, and intersected with the owner's current roles at authentication
+    -- time, so a demotion or a role change takes effect immediately.
+    roles           TEXT NOT NULL DEFAULT 'viewer',
     token_hash      TEXT NOT NULL UNIQUE,
     created_at      TEXT NOT NULL,
     expires_at      TEXT,
@@ -225,6 +229,18 @@ CREATE TABLE IF NOT EXISTS audit_events (
     at              TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_events(organization_id, at DESC);
+
+-- Failed-authentication ledger, used to throttle credential guessing. Kept in
+-- the database rather than in process memory so several web processes share one
+-- view of an attack, and so a restart does not reset an attacker's budget.
+CREATE TABLE IF NOT EXISTS auth_attempts (
+    id         TEXT PRIMARY KEY,
+    -- An opaque bucket key: the email attempted, or the client address.
+    scope_key  TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    successful INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_key ON auth_attempts(scope_key, at DESC);
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,

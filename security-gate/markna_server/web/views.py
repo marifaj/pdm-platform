@@ -16,6 +16,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from .. import __version__
 from ..domain import DomainError, EnvironmentKind, TriggerKind, ValidationError
+from ..service import TooManyAttempts
 from ..identity import SESSION_COOKIE, Permission
 from ..api.wsgi import (
     Context,
@@ -98,11 +99,17 @@ def _can(ctx: Context, permission: Permission) -> bool:
     return ctx.principal is not None and ctx.principal.has(permission)
 
 
-def _single_organization(ctx: Context):
-    """The organisation to name on the login page.
+def _organization_count(ctx: Context) -> int:
+    return ctx.services.organizations.count()
 
-    v1.0 deployments have exactly one; with more than one there is nothing to
-    show before the caller has identified themselves, so show nothing.
+
+def _login_organization(ctx: Context):
+    """The organisation to *name* on the sign-in page, if naming one is safe.
+
+    Cosmetic only: with a single organisation the page can greet the user by
+    name, and with several it stays anonymous. Authentication itself no longer
+    depends on this — sign-in resolves the account from the address across every
+    organisation, so more than one tenant does not break login.
     """
     organizations = ctx.services.uow.organizations.list()
     return organizations[0] if len(organizations) == 1 else None
@@ -124,8 +131,9 @@ def login_form(ctx: Context) -> Response:
     return render(
         ctx,
         "login.html",
-        organization=_single_organization(ctx),
+        organization=_login_organization(ctx),
         email=ctx.request.get("email"),
+        show_organization=_organization_count(ctx) > 1,
         error=ctx.request.get("err") or None,
     )
 
@@ -133,25 +141,26 @@ def login_form(ctx: Context) -> Response:
 @router.post("/login")
 def login(ctx: Context) -> Response:
     form = ctx.request.form()
-    organization = _single_organization(ctx)
-    if organization is None:
-        return render(
-            ctx, "login.html", organization=None, email=form.get("email", ""),
-            error="This deployment has no organisation yet. Run `markna-server bootstrap`.",
-            status=400,
-        )
+    email = form.get("email", "").strip().lower()
+    slug = form.get("organization", "").strip().lower() or None
     try:
-        user, session = ctx.services.auth.login(
-            organization.id,
-            form.get("email", "").strip().lower(),
+        _, session = ctx.services.auth.login(
+            email,
             form.get("password", ""),
+            organization_slug=slug,
             user_agent=ctx.request.headers.get("user-agent", ""),
+            client_key=ctx.request.remote_addr,
+        )
+    except TooManyAttempts as exc:
+        return render(
+            ctx, "login.html", organization=_login_organization(ctx), email=email,
+            show_organization=_organization_count(ctx) > 1, error=exc.message, status=429,
         )
     except ValidationError as exc:
-        # Deliberately the same message for unknown user and wrong password.
+        # Identical message for an unknown address and a wrong password.
         return render(
-            ctx, "login.html", organization=organization, email=form.get("email", ""),
-            error=exc.message, status=401,
+            ctx, "login.html", organization=_login_organization(ctx), email=email,
+            show_organization=_organization_count(ctx) > 1, error=exc.message, status=401,
         )
     response = redirect("/")
     return response.set_cookie(

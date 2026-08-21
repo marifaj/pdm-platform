@@ -11,6 +11,11 @@
     <input id="email" name="email" type="email" autocomplete="username" required value="{{ email }}">
     <label for="password">Password</label>
     <input id="password" name="password" type="password" autocomplete="current-password" required>
+{% if show_organization %}
+    <label for="organization">Organisation</label>
+    <input id="organization" name="organization" type="text" autocomplete="organization"
+           placeholder="your organisation's slug">
+{% endif %}
     <p><button type="submit">Sign in</button></p>
   </fieldset>
 </form>

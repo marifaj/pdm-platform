@@ -167,12 +167,14 @@ class RunExecutor:
             if self.config.ai_model:
                 settings["ai-advisory"]["model"] = self.config.ai_model
 
+        targets = self.uow.targets.list_for_project(inputs.scope, project.id)
         return RunConfig(
             project_path=project_path,
             architecture_docs=documents,
             architecture_manifest_path=manifest,
             target_url=target_url,
             layers=layers,
+            available_layers=project.supported_layers(targets),
             authorization=authorization,
             policy=inputs.policy,
             workdir=Path(self.config.worker_workdir).resolve() / run.id,

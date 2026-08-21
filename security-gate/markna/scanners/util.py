@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from ..confinement import path_within, safe_read_text
+
 #: Directories that are never worth scanning and that skew results badly.
 DEFAULT_EXCLUDES = (
     ".git",
@@ -76,12 +78,19 @@ def find_files(
     excludes: Iterable[str] = DEFAULT_EXCLUDES,
     limit: int = 200,
 ) -> List[Path]:
-    """Locate files by glob pattern, skipping vendored and cache directories."""
+    """Locate files by glob pattern, skipping vendored and cache directories.
+
+    A match that resolves outside ``root`` is discarded: a repository can name a
+    file ``requirements.txt`` and point it at something the worker owns, and an
+    adapter that then reads or parses it would be reading outside the workspace.
+    """
     excluded = set(excludes)
     found: List[Path] = []
     for pattern in patterns:
         for path in sorted(root.rglob(pattern)):
             if any(part in excluded for part in path.parts):
+                continue
+            if not path_within(path, root):
                 continue
             if path.is_file():
                 found.append(path)
@@ -96,18 +105,30 @@ def read_snippet(
     end_line: Optional[int] = None,
     *,
     max_lines: int = 8,
+    root: Optional[Path] = None,
 ) -> str:
     """Read the source lines a finding points at, for use as evidence.
 
     Several scanners either omit the offending source or (newer Semgrep) return a
     placeholder, so MARKNA reads it back from disk itself.
+
+    ``root`` confines that read. A scanner may follow a symlink out of the
+    repository; this function will not quote what it finds there. Callers that
+    have a project root must pass it — omitting it is only correct for paths
+    MARKNA itself constructed.
     """
     if not path or not start_line:
         return ""
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
+    if root is not None:
+        text = safe_read_text(path, root)
+        if text is None:
+            return ""
+        lines = text.splitlines()
+    else:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
     start = max(1, int(start_line))
     end = min(len(lines), max(start, int(end_line or start_line)))
     end = min(end, start + max_lines - 1)

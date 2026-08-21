@@ -69,6 +69,114 @@ class HttpResponse:
         return "\n".join(lines)
 
 
+def _guarded_socket(
+    host: str,
+    port: int,
+    timeout: float,
+    source_address,
+    scope: Scope,
+) -> socket.socket:
+    """Resolve, vet every candidate address, then connect to a vetted one.
+
+    This is the connect-time half of scope enforcement. Validating the hostname
+    before the request and then letting the socket resolve the name again leaves
+    a window in which the answer can change (DNS rebinding); connecting to an
+    address that has *already* been checked closes it, because the address the
+    kernel dials is the address that was approved.
+    """
+    try:
+        candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError(f"could not resolve {host}: {exc}") from exc
+
+    last_error: Optional[Exception] = None
+    refused: List[str] = []
+    for family, socket_type, proto, _canonical, sockaddr in candidates:
+        address = sockaddr[0]
+        if not scope.address_allowed(address):
+            refused.append(address)
+            continue
+        connection = socket.socket(family, socket_type, proto)
+        try:
+            if timeout is not None:
+                connection.settimeout(timeout)
+            if source_address:
+                connection.bind(source_address)
+            connection.connect(sockaddr)
+            return connection
+        except OSError as exc:
+            connection.close()
+            last_error = exc
+
+    if refused and last_error is None:
+        raise ScopeError(
+            f"host '{host}' resolved only to out-of-scope address(es): {', '.join(refused)}. "
+            "Set authorization.allow_private_targets when assessing an internal UAT host."
+        )
+    raise last_error or OSError(f"could not connect to {host}:{port}")
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    """An HTTP connection that only dials scope-approved addresses."""
+
+    def __init__(self, *args, scope: Scope, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._scope = scope
+
+    def connect(self) -> None:  # pragma: no cover - exercised through HttpClient
+        self.sock = _guarded_socket(
+            self.host, self.port, self.timeout, self.source_address, self._scope
+        )
+        if getattr(self, "_tunnel_host", None):
+            self._tunnel()
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    """As above, with TLS wrapped over the vetted socket (SNI preserved)."""
+
+    def __init__(self, *args, scope: Scope, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._scope = scope
+
+    def connect(self) -> None:  # pragma: no cover - exercised through HttpClient
+        sock = _guarded_socket(
+            self.host, self.port, self.timeout, self.source_address, self._scope
+        )
+        if getattr(self, "_tunnel_host", None):
+            self.sock = sock
+            self._tunnel()
+            sock = self.sock
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
+
+
+class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, scope: Scope) -> None:
+        super().__init__()
+        self._scope = scope
+
+    def http_open(self, req):  # noqa: N802 - stdlib API
+        return self.do_open(
+            lambda *args, **kwargs: _GuardedHTTPConnection(*args, scope=self._scope, **kwargs),
+            req,
+        )
+
+
+class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, scope: Scope, context: ssl.SSLContext) -> None:
+        super().__init__(context=context)
+        self._scope = scope
+        self._ssl_context = context
+
+    def https_open(self, req):  # noqa: N802 - stdlib API
+        return self.do_open(
+            lambda *args, **kwargs: _GuardedHTTPSConnection(
+                *args, scope=self._scope, context=self._ssl_context, **kwargs
+            ),
+            req,
+        )
+
+
 class _ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Records the redirect chain and refuses out-of-scope hops."""
 
@@ -134,8 +242,12 @@ class HttpClient:
         for key, value in (headers or {}).items():
             request.add_header(key, value)
 
+        # Both handlers vet the resolved address at connect time, so a
+        # redirect, a rebinding answer or a multi-A record cannot reach a
+        # destination the scope forbids.
         handlers: List[urllib.request.BaseHandler] = [
-            urllib.request.HTTPSHandler(context=self._ssl_context())
+            _GuardedHTTPHandler(self.scope),
+            _GuardedHTTPSHandler(self.scope, self._ssl_context()),
         ]
         if follow_redirects:
             handler = _ScopedRedirectHandler(self.scope, chain)

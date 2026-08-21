@@ -104,7 +104,7 @@ class BanditScanner(Scanner):
             severity = Severity.MEDIUM
 
         absolute = project / rel_path if rel_path else None
-        evidence = read_snippet(absolute, line, end_line) or str(item.get("code", ""))
+        evidence = read_snippet(absolute, line, end_line, root=project) or ""
 
         return Finding(
             source=self.name,

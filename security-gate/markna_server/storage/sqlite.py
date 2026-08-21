@@ -21,6 +21,7 @@ from typing import Any, List, Optional, Sequence
 
 from markna.models import Layer, Location, Severity, Verdict, utc_now
 
+from ..domain import ids
 from ..domain import (
     AssessmentRun,
     AuditEvent,
@@ -78,10 +79,29 @@ class Database:
     def initialise(self) -> None:
         connection = self.connection
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self._migrate()
         connection.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
             (SCHEMA_VERSION,),
         )
+
+    def _migrate(self) -> None:
+        """Additive column migrations for databases created by an earlier build.
+
+        `CREATE TABLE IF NOT EXISTS` leaves an existing table untouched, so a
+        new column has to be added explicitly. Every migration here is additive
+        and idempotent; none drops or rewrites data.
+        """
+        for table, column, definition in (
+            ("api_tokens", "roles", "TEXT NOT NULL DEFAULT 'viewer'"),
+        ):
+            existing = {
+                row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+            if existing and column not in existing:
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
 
     def close(self) -> None:
         connection = getattr(self._local, "connection", None)
@@ -112,6 +132,13 @@ class Database:
         except sqlite3.IntegrityError as exc:
             raise Conflict(str(exc)) from exc
         return cursor.rowcount
+
+
+def _parse_roles(raw: str) -> set:
+    """Role names from a stored comma list, ignoring anything unrecognised."""
+    known = {role.value: role for role in Role}
+    parsed = {known[name] for name in str(raw or "").split(",") if name in known}
+    return parsed or {Role.VIEWER}
 
 
 def _dump(value: Any) -> str:
@@ -1035,6 +1062,19 @@ class SqliteIdentityRepository:
             )
         )
 
+    def find_users_by_email(self, email: str) -> List[User]:
+        """Every active-or-not account with this address, across organisations.
+
+        Login needs this: a principal belongs to one organisation, but the
+        person signing in only knows their address. Resolving here — rather
+        than assuming the deployment has exactly one organisation — is what
+        makes multi-tenant login work.
+        """
+        rows = self.db.query(
+            "SELECT * FROM users WHERE email=? ORDER BY organization_id", (email.lower(),)
+        )
+        return [u for u in (self._map_user(row) for row in rows) if u is not None]
+
     def find_user_by_subject(self, issuer: str, subject: str) -> Optional[User]:
         return self._map_user(
             self.db.one(
@@ -1053,13 +1093,14 @@ class SqliteIdentityRepository:
 
     def create_api_token(self, token: ApiToken) -> ApiToken:
         self.db.execute(
-            "INSERT INTO api_tokens(id, organization_id, user_id, name, token_hash, created_at,"
-            " expires_at, last_used_at, revoked_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO api_tokens(id, organization_id, user_id, name, roles, token_hash,"
+            " created_at, expires_at, last_used_at, revoked_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 token.id,
                 token.organization_id,
                 token.user_id,
                 token.name,
+                ",".join(sorted(role.value for role in token.roles)) or Role.VIEWER.value,
                 token.token_hash,
                 token.created_at,
                 token.expires_at,
@@ -1091,6 +1132,32 @@ class SqliteIdentityRepository:
             (scope.organization_id,),
         )
         return [t for t in (self._map_token(row) for row in rows) if t is not None]
+
+    # -- authentication throttling ----------------------------------------
+
+    def record_auth_attempt(self, scope_key: str, *, successful: bool) -> None:
+        self.db.execute(
+            "INSERT INTO auth_attempts(id, scope_key, at, successful) VALUES (?,?,?,?)",
+            (ids.new_id(ids.AUDIT), scope_key.lower()[:200], utc_now(), int(successful)),
+        )
+
+    def count_recent_auth_failures(self, scope_key: str, since: str) -> int:
+        row = self.db.one(
+            "SELECT COUNT(*) AS n FROM auth_attempts WHERE scope_key=? AND at>=?"
+            " AND successful=0",
+            (scope_key.lower()[:200], since),
+        )
+        return int(row["n"]) if row else 0
+
+    def clear_auth_failures(self, scope_key: str) -> None:
+        self.db.execute(
+            "DELETE FROM auth_attempts WHERE scope_key=? AND successful=0",
+            (scope_key.lower()[:200],),
+        )
+
+    def purge_auth_attempts(self, before: str) -> int:
+        cursor = self.db.execute("DELETE FROM auth_attempts WHERE at < ?", (before,))
+        return cursor.rowcount
 
     # -- sessions ----------------------------------------------------------
 
@@ -1164,6 +1231,7 @@ class SqliteIdentityRepository:
             organization_id=row["organization_id"],
             user_id=row["user_id"],
             name=row["name"],
+            roles=_parse_roles(row["roles"] if "roles" in row.keys() else ""),
             token_hash=row["token_hash"],
             created_at=row["created_at"],
             expires_at=row["expires_at"],

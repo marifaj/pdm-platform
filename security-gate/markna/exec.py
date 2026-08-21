@@ -15,6 +15,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+#: Environment variables a scanner subprocess may see. Everything else is
+#: withheld — notably ANTHROPIC_API_KEY, MARKNA_* (which name the database and
+#: the workspace) and any cloud credentials on the host.
+SAFE_ENV_NAMES = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "TMPDIR", "TEMP", "TMP",
+    "LANG", "LANGUAGE", "TERM",
+    # TLS trust, so tools can validate certificates behind a corporate CA.
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    # Egress proxying, without which a networked scanner cannot reach its
+    # advisory database at all.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    # Container runtime, for the ZAP baseline scanner.
+    "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY",
+    # Java tooling used by some scanners.
+    "JAVA_HOME",
+})
+
+#: Prefixes kept as well: locale settings, and per-tool configuration that an
+#: operator sets deliberately for a scanner rather than for MARKNA.
+SAFE_ENV_PREFIXES = ("LC_", "SEMGREP_", "TRIVY_", "GRYPE_", "SYFT_", "BANDIT_", "CHECKOV_")
+
+
+def _has_safe_prefix(name: str) -> bool:
+    return name.startswith(SAFE_ENV_PREFIXES)
+
+
 #: Hard cap on captured output per stream. Some scanners emit tens of MB of JSON
 #: on large repositories; we stream those to a file instead (see ``output_file``).
 MAX_CAPTURED_CHARS = 40_000_000
@@ -80,8 +107,21 @@ class ToolPath:
         return shutil.which(executable, path=self.search_path())
 
     def environ(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        env = dict(os.environ)
+        """Build the environment a scanner subprocess receives.
+
+        Allow-listed, not inherited. Scanners are large third-party programs
+        that parse hostile input from the repository under assessment; handing
+        them the worker's whole environment would hand them its API keys,
+        database path and cloud credentials as well. Anything a tool genuinely
+        needs is either on this list or passed explicitly by its adapter.
+        """
+        env = {
+            name: value
+            for name, value in os.environ.items()
+            if name in SAFE_ENV_NAMES or _has_safe_prefix(name)
+        }
         env["PATH"] = self.search_path()
+        env.setdefault("HOME", os.environ.get("HOME", "/tmp"))
         if extra_env:
             env.update(extra_env)
         return env

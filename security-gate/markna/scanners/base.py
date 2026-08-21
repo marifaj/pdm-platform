@@ -80,6 +80,16 @@ class ScannerContext:
     #: Commands executed during the current scanner, for the run record.
     commands: List[str] = field(default_factory=list)
 
+    @property
+    def confinement_root(self) -> Optional[Path]:
+        """The directory every code-layer read must stay inside.
+
+        Scanner adapters pass this to :func:`markna.scanners.util.read_snippet`
+        so that a symlink out of the repository cannot pull external file
+        contents into a report.
+        """
+        return self.project_path
+
     def setting(self, scanner: str, key: str, default: Any = None) -> Any:
         return self.settings.get(scanner, {}).get(key, default)
 

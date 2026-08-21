@@ -231,6 +231,24 @@ suppressions:
 `markna capabilities` lists the capability vocabulary that
 `required_capabilities` accepts.
 
+### The floor a policy cannot lower
+
+A policy tunes the gate; it cannot switch it off. Some requirements are
+structural and are restored whichever way the file is written:
+
+| Floor | Effect |
+| --- | --- |
+| `architecture: [architecture-review]`, `code: [sast, secrets]`, `environment: [transport-security]` | Restored into `required_capabilities` if a policy drops them. |
+| `critical` in `block_on` | Restored if a policy removes it. |
+| Floor findings | Not suppressible and not re-rateable by `severity_overrides`. |
+| Zero mandatory capabilities evaluated | `BLOCK`. An assessment that proves nothing cannot pass. |
+| A configured layer that was not assessed | Surfaced as a finding, so the gap is visible in the report. |
+
+An attempt to lower the floor is not silently ignored — it is recorded as a
+`policy/floor-restored` finding, so the report shows both what was requested and
+what the gate insisted on. This means the worst a mis-written or hostile policy
+can do is make the gate noisier, never quieter.
+
 ## Architecture layer
 
 Free-text documents cannot be checked mechanically, so MARKNA reads both:
@@ -370,13 +388,29 @@ URL exists.
 ```bash
 cd security-gate
 pip install -e ".[dev]"
-pytest                     # 261 tests, no external scanners or network required
+pytest                     # 405 tests; the scanner-integration tests skip
+                           # without semgrep/bandit, everything else needs neither
 ```
 
 The suite covers the finding model, the policy engine's verdict and coverage
 logic, redaction, both architecture engines, the environment scanners (against a
 local throwaway HTTP server), all four report formats, the CLI exit-code
 contract, tenant isolation, the HTTP surfaces end to end, and the queue.
+
+Security-acceptance regression suites, each written from the attacker's side:
+
+| File | Property |
+| --- | --- |
+| `test_gate_floor.py` | No policy can produce an unconditional `PASS`. |
+| `test_confinement.py` | A repository symlink never leads the gate out of the workspace. |
+| `test_server_auth_hardening.py` | Multi-tenant login, token privilege, throttling, uniform failure. |
+| `test_http_hardening.py` | Malformed `Content-Length` and body limits, over a real socket. |
+| `test_execution_hardening.py` | Connect-time destination checks; scanner environment allow-list. |
+| `test_scanner_integration.py` | Semgrep and Bandit really execute against the vulnerable fixture. |
+
+`test_scanner_integration.py` skips when the binaries are absent. A skip is a
+coverage gap, not a pass — run it with `-rs` in CI and treat skips as failures
+on the machine that gates releases.
 
 `tests/test_layering.py` enforces the architecture rather than describing it: it
 parses the import graph and fails if a user-facing module reaches the scanner
@@ -394,7 +428,8 @@ markna/                    the scanner engine — standalone, no server imports
 ├── authorization.py       environment authorisation and scope enforcement
 ├── http.py                read-only, scope-checked HTTP client
 ├── redact.py              credential redaction for evidence
-├── exec.py                bounded subprocess execution and tool discovery
+├── exec.py                bounded subprocess execution; allow-listed environment
+├── confinement.py         workspace confinement: traversal, reads, reporting
 ├── scanners/              one adapter per tool; each declares its capabilities
 ├── rules/semgrep/         bundled offline SAST ruleset
 ├── ai/                    Anthropic reasoning layer (advisory)

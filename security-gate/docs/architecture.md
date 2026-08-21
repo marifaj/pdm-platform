@@ -94,6 +94,15 @@ default; one with a `project_id` is that project's override. Resolution order is
 new version, and each run records the `policy_id` that judged it, so "why did
 this pass in March?" is answerable.
 
+A policy is bounded from below. `MANDATORY_CAPABILITIES` and
+`MANDATORY_BLOCK_SEVERITIES` in `markna/policy.py` are unioned into whatever the
+document asks for, floor findings are exempt from suppressions and severity
+overrides, and a verdict computed with zero mandatory capabilities evaluated is
+`BLOCK` rather than `PASS`. The reasoning is that policy authorship is a
+maintainer-level privilege while switching off the gate is not, so the two have
+to be separable — a maintainer can decide that a `medium` does not block a
+release, and cannot decide that nothing does.
+
 ### Report
 A rendered artefact of a run in one format (JSON, Markdown, SARIF, HTML). Stored
 per run and per format; listings return metadata, only the download endpoint
@@ -182,6 +191,31 @@ same three roles rather than introducing a parallel model.
 | `maintainer` | viewer + write projects, write policies, create and cancel runs |
 | `admin` | maintainer + organisation administration, manage API tokens and users |
 
+Roles are discrete labels, not a ladder: a maintainer holds `maintainer`, not
+`{viewer, maintainer}`. Anywhere two grants are compared — issuing a token,
+resolving a token's effective privilege — the comparison is on **permission
+sets**, never on role names, so a maintainer can mint a read-only CI token
+without holding the `viewer` label.
+
+**API tokens** carry their own explicit roles, defaulting to the issuer's. The
+issuing path rejects any token whose permissions exceed the issuer's, and the
+provider re-checks that at authentication time against the live user, so
+demoting a user immediately bounds every token they issued. Anyone who can hold
+a session can mint a token no stronger than themselves; only an administrator
+can see or revoke someone else's.
+
+**Login is not scoped to a singleton organisation.** The caller supplies an
+address; accounts are resolved across every tenant and the match determines the
+scope. An address valid in two tenants is refused until the caller also names
+the organisation slug — the ambiguity is only reachable by someone who has
+already proved the password in both, so saying so discloses nothing. Failure is
+uniform (a decoy verification runs when no account matches, so an unknown
+address costs the same work) and bounded (failures are counted per address and
+per client; past the threshold the attempt is refused before any verification).
+The failure counters are deliberately **not** tenant-scoped: throttling has to
+happen before the tenant is known, and keying it by tenant would let an attacker
+sidestep the limit by varying the organisation.
+
 ---
 
 ## 5. Execution separation
@@ -251,6 +285,30 @@ A gate that checks other systems for these has to have them.
   OPTIONS.
 * **Uniform failure messages** — unknown user and wrong password produce the
   same text; cross-tenant lookups produce 404.
+* **Workspace confinement** — the repository under assessment is hostile input.
+  `markna/confinement.py` holds three independent controls: the walk never
+  descends a symlinked directory or yields a file resolving outside the project
+  root; every read MARKNA performs on a scanner-reported path is confined to
+  that root; and any finding whose location escapes has its evidence stripped
+  and replaced by an explicit escape finding. A third-party scanner may still
+  follow a link — what it cannot do is make MARKNA quote the result into a
+  report. Confinement is by resolved path, not string prefix.
+* **Scanner environments are allow-listed** — a scanner subprocess receives
+  `PATH`, `HOME`, locale, TLS trust, proxy settings and its own `TOOL_*`
+  configuration. It does not receive the worker's API keys, database path or
+  cloud credentials.
+* **Destination enforcement at connect time** — the environment client resolves
+  the host itself, vets each candidate address, and connects to an address that
+  has already been approved. Checking a hostname and then letting the socket
+  resolve it again leaves a window in which the answer can change; this closes
+  it.
+* **Request parsing inside the error boundary** — a negative or non-numeric
+  `Content-Length` is a 400, not an exception escaping the WSGI callable, and
+  the body limit is enforced on the read rather than trusting the header.
+* **API CSRF** — session-authenticated writes to `/api/` must present a
+  session-bound header a cross-origin form cannot set; JSON endpoints require
+  `Content-Type: application/json`, which closes the simple-request shape.
+  Bearer-token callers are exempt: a token is not an ambient credential.
 
 ---
 

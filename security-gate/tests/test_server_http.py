@@ -210,8 +210,30 @@ class TestPermissionsOverHttp:
     def test_a_viewer_may_not_queue_a_run(self, viewer_client: Client, project):
         assert viewer_client.post_json(f"/api/v1/projects/{project.id}/runs", {})[0] == 403
 
-    def test_a_viewer_may_not_manage_tokens(self, viewer_client: Client):
-        assert viewer_client.get_json("/api/v1/tokens")[0] == 403
+    def test_a_viewer_may_mint_a_read_only_token_for_itself(self, viewer_client: Client):
+        status, created = viewer_client.post_json(
+            "/api/v1/tokens", {"name": "ci", "roles": ["viewer"]}
+        )
+        assert status == 201 and created["roles"] == ["viewer"]
+
+    def test_a_viewer_may_not_mint_a_token_above_its_own_role(self, viewer_client: Client):
+        status, payload = viewer_client.post_json(
+            "/api/v1/tokens", {"name": "escalate", "roles": ["admin"]}
+        )
+        assert status == 403
+        assert "issuer does not hold" in payload["error"]["message"]
+
+    def test_a_viewer_only_sees_its_own_tokens(self, viewer_client: Client, api_client: Client):
+        api_client.post_json("/api/v1/tokens", {"name": "admins-token"})
+        viewer_client.post_json("/api/v1/tokens", {"name": "mine", "roles": ["viewer"]})
+
+        _, listed = viewer_client.get_json("/api/v1/tokens")
+        names = {item["name"] for item in listed["items"]}
+        assert "mine" in names
+        assert "admins-token" not in names, "a viewer must not see another user's tokens"
+
+        _, all_tokens = api_client.get_json("/api/v1/tokens")
+        assert {"mine", "admins-token"} <= {item["name"] for item in all_tokens["items"]}
 
 
 class TestCrossTenantOverHttp:

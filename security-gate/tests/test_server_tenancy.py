@@ -16,7 +16,7 @@ from markna_server.domain import (
     TenantIsolationError,
     TenantScope,
 )
-from markna_server.identity import AccessControl, Permission
+from markna_server.identity import AccessControl, Permission, Role
 from markna_server.service import Services
 
 from conftest import make_user, principal_for
@@ -127,13 +127,15 @@ class TestRoles:
         with pytest.raises(PermissionDenied):
             services.runs.enqueue(viewer, project.id)
 
-    def test_maintainer_can_queue_but_not_manage_tokens(self, services, maintainer):
+    def test_maintainer_can_queue_and_mint_a_token_within_its_own_role(self, services, maintainer):
         project = services.projects.create(
             maintainer, slug="demo", name="Demo", architecture_manifest="demo/architecture.yaml"
         )
         assert services.runs.enqueue(maintainer, project.id)
+        token, _ = services.auth.issue_api_token(maintainer, "ci", roles=["viewer"])
+        assert token.roles == {Role.VIEWER}
         with pytest.raises(PermissionDenied):
-            services.auth.issue_api_token(maintainer, "nope")
+            services.auth.issue_api_token(maintainer, "escalate", roles=["admin"])
 
     def test_admin_has_every_permission(self, admin):
         assert set(admin.permissions) == set(Permission)

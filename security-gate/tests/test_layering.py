@@ -216,7 +216,11 @@ class TestTenantScopingIsStructural:
     def test_every_tenant_table_carries_an_organization_id(self):
         schema = (SERVER / "storage" / "schema.sql").read_text(encoding="utf-8")
         statements = schema.split("CREATE TABLE IF NOT EXISTS ")[1:]
-        exempt = {"organizations", "schema_meta"}
+        # auth_attempts is deliberately tenant-free: throttling has to happen
+        # before an account — and therefore an organisation — has been
+        # identified, and keying it by tenant would let an attacker sidestep the
+        # limit by guessing against a different organisation.
+        exempt = {"organizations", "schema_meta", "auth_attempts"}
         for statement in statements:
             table = statement.split("(", 1)[0].strip()
             if table in exempt:

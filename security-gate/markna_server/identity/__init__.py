@@ -8,7 +8,7 @@ Nothing outside this package should reference a provider by name.
 from .access import AccessControl
 from .credentials import ApiToken, Session, expiry_from_now, is_expired
 from .passwords import generate_api_token, hash_api_token, hash_password, verify_password
-from .principal import Permission, Principal, Role, User
+from .principal import Permission, Principal, Role, User, permissions_for
 from .providers import (
     SESSION_COOKIE,
     ApiTokenProvider,
@@ -28,5 +28,5 @@ __all__ = [
     "Principal", "ProviderChain", "Role", "SESSION_COOKIE", "Session",
     "SessionProvider", "TrustedHeaderProvider", "User", "build_chain",
     "expiry_from_now", "generate_api_token", "hash_api_token", "hash_password",
-    "is_expired", "verify_password",
+    "is_expired", "permissions_for", "verify_password",
 ]

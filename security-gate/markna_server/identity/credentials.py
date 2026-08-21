@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Set
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .principal import Role
 
 from markna.models import utc_now
 
@@ -24,6 +27,9 @@ class ApiToken:
     organization_id: str = ""
     user_id: str = ""
     name: str = ""
+    #: The token's own privileges. Never wider than the issuer's at creation,
+    #: and intersected with the owner's current roles when the token is used.
+    roles: Set["Role"] = field(default_factory=set)
     token_hash: str = ""
     created_at: str = field(default_factory=utc_now)
     expires_at: Optional[str] = None

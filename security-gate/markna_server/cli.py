@@ -125,6 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
     token_create = token_sub.add_parser("create")
     token_create.add_argument("--name", required=True)
     token_create.add_argument("--expires", help="YYYY-MM-DDTHH:MM:SSZ")
+    token_create.add_argument(
+        "--role", action="append", default=[], choices=[role.value for role in Role],
+        help="role granted to the token; repeatable. Defaults to viewer (read-only, CI-safe).",
+    )
     token_sub.add_parser("list")
     token_revoke = token_sub.add_parser("revoke")
     token_revoke.add_argument("token_id")
@@ -307,8 +311,14 @@ def _token(args: argparse.Namespace, config: ServerConfig) -> int:
     services = _services(config)
     principal = cli_principal(services, _only_organization(services))
     if args.token_command == "create":
-        token, secret = services.auth.issue_api_token(principal, args.name, expires_at=args.expires)
-        print(f"{token.id}  {token.name}")
+        token, secret = services.auth.issue_api_token(
+            principal,
+            args.name,
+            roles=args.role or [Role.VIEWER.value],
+            expires_at=args.expires,
+        )
+        roles = ", ".join(sorted(role.value for role in token.roles))
+        print(f"{token.id}  {token.name}  roles={roles}")
         print(secret)
         print("store this now: only its hash is kept")
         return EXIT_OK
@@ -318,7 +328,9 @@ def _token(args: argparse.Namespace, config: ServerConfig) -> int:
         return EXIT_OK if revoked else EXIT_ERROR
     for token in services.auth.list_api_tokens(principal):
         state = "usable" if token.is_usable else "revoked/expired"
-        print(f"{token.id}  {token.name:<28} {state:<16} last_used={token.last_used_at or 'never'}")
+        roles = ",".join(sorted(role.value for role in token.roles))
+        print(f"{token.id}  {token.name:<24} {roles:<20} {state:<16} "
+              f"last_used={token.last_used_at or 'never'}")
     return EXIT_OK
 
 

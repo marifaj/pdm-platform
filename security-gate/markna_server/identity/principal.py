@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Optional, Set
+from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 
 from ..domain import TenantScope, ids
 
@@ -26,6 +26,9 @@ class Permission(str, enum.Enum):
     RUN_CREATE = "run:create"
     RUN_CANCEL = "run:cancel"
     REPORT_READ = "report:read"
+    #: Mint a token for yourself, never wider than your own roles.
+    TOKEN_CREATE = "token:create"
+    #: Administer other people's tokens.
     TOKEN_MANAGE = "token:manage"
 
 
@@ -48,6 +51,7 @@ _VIEWER: FrozenSet[Permission] = frozenset(
         Permission.POLICY_READ,
         Permission.RUN_READ,
         Permission.REPORT_READ,
+        Permission.TOKEN_CREATE,
     }
 )
 
@@ -69,6 +73,19 @@ _ROLE_PERMISSIONS: Dict[Role, FrozenSet[Permission]] = {
     Role.MAINTAINER: _MAINTAINER,
     Role.ADMIN: _ADMIN,
 }
+
+
+def permissions_for(roles: Iterable["Role"]) -> FrozenSet[Permission]:
+    """The permissions a set of roles grants, combined.
+
+    Roles are discrete labels, not a ladder: `maintainer` does not literally
+    contain `viewer`. Privilege comparisons therefore have to be made on the
+    permissions the roles imply, never on the role names themselves.
+    """
+    granted: Set[Permission] = set()
+    for role in roles:
+        granted |= role.permissions
+    return frozenset(granted)
 
 
 @dataclass
