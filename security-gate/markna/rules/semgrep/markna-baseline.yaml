@@ -1,0 +1,409 @@
+# MARKNA baseline Semgrep ruleset.
+#
+# Used when the Semgrep registry is unreachable (air-gapped build agents, egress
+# proxies) or when `use_registry: false` is set for the semgrep scanner. It is a
+# floor, not a replacement: when the registry is reachable, point the scanner at
+# `p/default` / `p/owasp-top-ten` as well and get several thousand more rules.
+#
+# Every rule carries CWE and OWASP metadata plus a `remediation` string, which
+# MARKNA lifts straight into the finding.
+rules:
+  # ------------------------------------------------------------------ Python
+  - id: markna-py-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      subprocess is invoked with shell=True. If any part of the command string is
+      attacker-influenced this is OS command injection.
+    metadata:
+      cwe: ["CWE-78"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: >-
+        Pass the command as a list of arguments and leave shell=False. If a shell
+        is genuinely required, build the command from a fixed allow-list.
+      references: ["https://docs.python.org/3/library/subprocess.html#security-considerations"]
+    patterns:
+      - pattern: subprocess.$FN(..., shell=True, ...)
+      - pattern-not: subprocess.$FN("...", ..., shell=True, ...)
+
+  - id: markna-py-os-system
+    languages: [python]
+    severity: ERROR
+    message: >-
+      os.system() executes a string through the shell. Any interpolated value is a
+      command-injection sink.
+    metadata:
+      cwe: ["CWE-78"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: "Use subprocess.run([...]) with an argument list instead of os.system()."
+    patterns:
+      - pattern: os.system($CMD)
+      - pattern-not: os.system("...")
+
+  - id: markna-py-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: >-
+      eval()/exec() on a non-literal value executes arbitrary Python.
+    metadata:
+      cwe: ["CWE-95"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: >-
+        Replace with explicit parsing (json.loads, ast.literal_eval, or a lookup
+        table of permitted operations).
+    patterns:
+      - pattern-either:
+          - pattern: eval($X, ...)
+          - pattern: exec($X, ...)
+      - pattern-not: eval("...", ...)
+      - pattern-not: exec("...", ...)
+
+  - id: markna-py-yaml-unsafe-load
+    languages: [python]
+    severity: ERROR
+    message: >-
+      yaml.load() without SafeLoader can instantiate arbitrary Python objects from
+      untrusted YAML.
+    metadata:
+      cwe: ["CWE-502"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+      remediation: "Use yaml.safe_load(), or yaml.load(data, Loader=yaml.SafeLoader)."
+    patterns:
+      - pattern-either:
+          - pattern: yaml.load($X)
+          - pattern: yaml.load($X, Loader=yaml.Loader)
+          - pattern: yaml.load($X, Loader=yaml.UnsafeLoader)
+          - pattern: yaml.load($X, Loader=yaml.FullLoader)
+
+  - id: markna-py-pickle-load
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Deserialising with pickle/dill/shelve executes code embedded in the payload.
+    metadata:
+      cwe: ["CWE-502"]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+      remediation: >-
+        Use a data-only format (JSON, Protobuf, MessagePack) for anything that
+        crosses a trust boundary. Reserve pickle for trusted, local, same-version data.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: dill.load(...)
+      - pattern: dill.loads(...)
+      - pattern: cPickle.loads(...)
+
+  - id: markna-py-flask-debug
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Flask is started with debug=True. The Werkzeug debugger exposes an
+      interactive console to anyone who can reach the app.
+    metadata:
+      cwe: ["CWE-489"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      remediation: >-
+        Drive debug from configuration and keep it false everywhere except a
+        developer workstation. Never ship a debug build to UAT.
+    pattern-either:
+      - pattern: $APP.run(..., debug=True, ...)
+      - pattern: flask.Flask(...).run(..., debug=True, ...)
+
+  - id: markna-py-django-debug-true
+    languages: [python]
+    severity: WARNING
+    message: "Django DEBUG is enabled; error pages leak settings, SQL and stack traces."
+    metadata:
+      cwe: ["CWE-489"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      remediation: "Set DEBUG = False for every deployed environment and configure ALLOWED_HOSTS."
+    paths:
+      include: ["*settings*.py"]
+    pattern: DEBUG = True
+
+  - id: markna-py-tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled, which removes protection against
+      an active network attacker.
+    metadata:
+      cwe: ["CWE-295"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      remediation: >-
+        Keep verification on. For an internal CA, pass verify="/path/to/ca.pem"
+        or install the CA into the trust store.
+    pattern-either:
+      - pattern: requests.$FN(..., verify=False, ...)
+      - pattern: httpx.$FN(..., verify=False, ...)
+      - pattern: ssl._create_unverified_context(...)
+      - pattern: $CTX.verify_mode = ssl.CERT_NONE
+      - pattern: $CTX.check_hostname = False
+
+  - id: markna-py-weak-hash
+    languages: [python]
+    severity: WARNING
+    message: >-
+      MD5/SHA-1 are not collision resistant and are not password hashes.
+    metadata:
+      cwe: ["CWE-327", "CWE-916"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      remediation: >-
+        Use SHA-256+ for integrity, and argon2id/bcrypt/scrypt (never a bare hash)
+        for passwords. If the hash is a non-security checksum, pass
+        usedforsecurity=False to make that explicit.
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+      - pattern: hashlib.new("md5", ...)
+      - pattern: hashlib.new("sha1", ...)
+
+  - id: markna-py-sql-string-building
+    languages: [python]
+    severity: ERROR
+    message: >-
+      SQL is assembled with string formatting/concatenation, which is the classic
+      SQL injection pattern.
+    metadata:
+      cwe: ["CWE-89"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: >-
+        Use parameterised queries: cursor.execute("... WHERE x = ?", (value,)).
+        Never interpolate values into SQL text.
+    pattern-either:
+      - pattern: $CUR.execute("..." % ..., ...)
+      - pattern: $CUR.execute("..." + $X, ...)
+      - pattern: $CUR.execute(f"...{$X}...", ...)
+      - pattern: $CUR.execute("...".format(...), ...)
+      - pattern: $CUR.executemany("..." % ..., ...)
+      - pattern: $CUR.executemany(f"...{$X}...", ...)
+
+  - id: markna-py-jinja-autoescape-off
+    languages: [python]
+    severity: ERROR
+    message: "Jinja2 environment created without autoescaping; template output is an XSS sink."
+    metadata:
+      cwe: ["CWE-79"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: "Pass autoescape=True (or select_autoescape()) when constructing the Environment."
+    pattern-either:
+      - pattern: jinja2.Environment(...)
+      - pattern: Environment(...)
+    pattern-not-either:
+      - pattern: jinja2.Environment(..., autoescape=True, ...)
+      - pattern: jinja2.Environment(..., autoescape=select_autoescape(...), ...)
+      - pattern: Environment(..., autoescape=True, ...)
+      - pattern: Environment(..., autoescape=select_autoescape(...), ...)
+
+  - id: markna-py-insecure-temp-file
+    languages: [python]
+    severity: WARNING
+    message: "tempfile.mktemp() is race-prone; the name can be claimed between check and use."
+    metadata:
+      cwe: ["CWE-377"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      remediation: "Use tempfile.NamedTemporaryFile() or tempfile.mkstemp()."
+    pattern: tempfile.mktemp(...)
+
+  - id: markna-py-weak-random-for-secrets
+    languages: [python]
+    severity: WARNING
+    message: >-
+      The random module is not cryptographically secure; predictable values must
+      not be used for tokens, passwords or session identifiers.
+    metadata:
+      cwe: ["CWE-338"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      remediation: "Use the secrets module (secrets.token_urlsafe, secrets.choice)."
+    pattern-either:
+      - pattern: random.random()
+      - pattern: random.randint(...)
+      - pattern: random.choice(...)
+      - pattern: random.randrange(...)
+
+  - id: markna-py-xxe-prone-xml-parser
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Standard-library XML parsers are vulnerable to entity-expansion and, for
+      lxml, external-entity attacks on untrusted input.
+    metadata:
+      cwe: ["CWE-611"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      remediation: "Parse untrusted XML with defusedxml, or disable entity resolution explicitly."
+    pattern-either:
+      - pattern: xml.etree.ElementTree.fromstring(...)
+      - pattern: xml.etree.ElementTree.parse(...)
+      - pattern: xml.dom.minidom.parse(...)
+      - pattern: xml.sax.parse(...)
+      - pattern: lxml.etree.fromstring(...)
+
+  - id: markna-py-bind-all-interfaces
+    languages: [python]
+    severity: WARNING
+    message: >-
+      The service binds 0.0.0.0, so it listens on every interface including any
+      public one the host has.
+    metadata:
+      cwe: ["CWE-668"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      remediation: >-
+        Bind 127.0.0.1 when the service is only consumed locally, and let the
+        reverse proxy or the network policy decide what is reachable.
+    pattern-either:
+      - pattern: $APP.run(..., host="0.0.0.0", ...)
+      - pattern: $SOCK.bind(("0.0.0.0", ...))
+      - pattern: $SOCK.bind(("", ...))
+
+  - id: markna-py-jwt-decode-unverified
+    languages: [python]
+    severity: ERROR
+    message: "JWT decoded without signature verification; the token contents are attacker-controlled."
+    metadata:
+      cwe: ["CWE-347"]
+      owasp: ["A07:2021 - Identification and Authentication Failures"]
+      remediation: >-
+        Verify the signature and pin the expected algorithm:
+        jwt.decode(token, key, algorithms=["RS256"]).
+    pattern-either:
+      - pattern: jwt.decode(..., verify=False, ...)
+      - pattern: 'jwt.decode(..., options={..., "verify_signature": False, ...}, ...)'
+      - pattern: jwt.get_unverified_claims(...)
+
+  - id: markna-py-mqtt-without-tls
+    languages: [python]
+    severity: WARNING
+    message: >-
+      MQTT client connects without calling tls_set(), so telemetry and credentials
+      cross the network in clear text.
+    metadata:
+      cwe: ["CWE-319"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      remediation: >-
+        Call client.tls_set(ca_certs=...) before connect(), and use port 8883.
+        If the broker is loopback-only, document that as an accepted trust boundary.
+    patterns:
+      - pattern-inside: |
+          $CLIENT = mqtt.Client(...)
+          ...
+      - pattern: $CLIENT.connect($HOST, 1883, ...)
+
+  - id: markna-py-assert-for-authorization
+    languages: [python]
+    severity: WARNING
+    message: >-
+      assert is used for an access-control decision. Assertions are removed when
+      Python runs with -O, which would silently disable the check.
+    metadata:
+      cwe: ["CWE-617"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      remediation: "Raise an explicit exception (403/PermissionError) instead of asserting."
+    pattern-either:
+      - pattern: assert $USER.is_admin, ...
+      - pattern: assert $USER.is_authenticated, ...
+      - pattern: assert $X.has_permission(...), ...
+
+  # -------------------------------------------------------- JavaScript / TS
+  - id: markna-js-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "eval()/new Function() on a non-literal executes arbitrary JavaScript."
+    metadata:
+      cwe: ["CWE-95"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: "Parse data with JSON.parse, or dispatch through an explicit map of allowed operations."
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: new Function($X)
+      - pattern-not: eval("...")
+
+  - id: markna-js-child-process-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "child_process.exec runs its argument through a shell; interpolation is command injection."
+    metadata:
+      cwe: ["CWE-78"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: "Use execFile/spawn with an argument array."
+    patterns:
+      - pattern-either:
+          - pattern: child_process.exec($CMD, ...)
+          - pattern: exec($CMD, ...)
+      - pattern-not: child_process.exec("...", ...)
+      - pattern-not: exec("...", ...)
+
+  - id: markna-js-tls-reject-unauthorized-off
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "TLS certificate validation is disabled process-wide or per request."
+    metadata:
+      cwe: ["CWE-295"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      remediation: "Remove the override and trust the internal CA properly (NODE_EXTRA_CA_CERTS)."
+    pattern-either:
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+      - pattern: $O.rejectUnauthorized = false
+      - pattern: "{..., rejectUnauthorized: false, ...}"
+
+  - id: markna-js-react-dangerously-set-inner-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "dangerouslySetInnerHTML bypasses React's escaping and is an XSS sink."
+    metadata:
+      cwe: ["CWE-79"]
+      owasp: ["A03:2021 - Injection"]
+      remediation: "Render text as children, or sanitise with DOMPurify before injecting HTML."
+    pattern: "<$EL dangerouslySetInnerHTML={...} />"
+
+  - id: markna-js-jwt-none-algorithm
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: "JWT verification accepts the 'none' algorithm or skips verification."
+    metadata:
+      cwe: ["CWE-347"]
+      owasp: ["A07:2021 - Identification and Authentication Failures"]
+      remediation: "Call jwt.verify with an explicit algorithms allow-list, e.g. ['RS256']."
+    pattern-either:
+      - pattern: 'jwt.verify($T, $K, {..., algorithms: [..., "none", ...], ...})'
+      - pattern: 'jwt.decode($T, {..., complete: true, ...})'
+
+  - id: markna-js-express-cors-wildcard
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      CORS is configured to reflect or allow any origin. Combined with credentials
+      this exposes authenticated endpoints to any site.
+    metadata:
+      cwe: ["CWE-942"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      remediation: "Set an explicit origin allow-list; never combine origin '*' or reflection with credentials: true."
+    pattern-either:
+      - pattern: 'cors({..., origin: "*", ...})'
+      - pattern: 'cors({..., origin: true, ...})'
+      - pattern: $RES.setHeader("Access-Control-Allow-Origin", "*")
+      - pattern: $RES.header("Access-Control-Allow-Origin", "*")
+
+  - id: markna-js-insecure-cookie
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "Session cookie is set without the Secure and HttpOnly attributes."
+    metadata:
+      cwe: ["CWE-1004", "CWE-614"]
+      owasp: ["A05:2021 - Security Misconfiguration"]
+      remediation: "Set { httpOnly: true, secure: true, sameSite: 'lax' } on session cookies."
+    patterns:
+      - pattern: '$RES.cookie($NAME, $VALUE, {...})'
+      - pattern-not: '$RES.cookie($NAME, $VALUE, {..., httpOnly: true, ..., secure: true, ...})'
+      - pattern-not: '$RES.cookie($NAME, $VALUE, {..., secure: true, ..., httpOnly: true, ...})'
+
+  - id: markna-js-math-random-for-secrets
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: "Math.random() is predictable and must not generate tokens or identifiers."
+    metadata:
+      cwe: ["CWE-338"]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      remediation: "Use crypto.randomUUID() or crypto.randomBytes()."
+    pattern: Math.random()

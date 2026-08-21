@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "markna-security-gate"
+version = "1.0.0"
+description = "Independent pre-UAT security review across architecture, source code and the deployed environment."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["security", "sast", "dast", "sbom", "threat-model", "release-gate"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+# The gate itself runs on the standard library plus PyYAML. The scanners it
+# drives are separate tools, installed from requirements-scanners.txt or as
+# system binaries, so that a missing scanner is a visible coverage gap rather
+# than an import error.
+dependencies = ["PyYAML>=5.1"]
+
+[project.optional-dependencies]
+ai = ["anthropic>=0.40"]
+scanners = [
+    "semgrep>=1.60",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+    "detect-secrets>=1.4",
+    "cyclonedx-bom>=4.0",
+]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+markna = "markna.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["markna*"]
+
+[tool.setuptools.package-data]
+markna = ["rules/semgrep/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

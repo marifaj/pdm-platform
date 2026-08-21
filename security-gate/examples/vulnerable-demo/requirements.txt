@@ -1,0 +1,5 @@
+# Fixture dependencies, pinned to versions with published advisories so the
+# dependency scanners have something to report.
+flask==0.12.2
+requests==2.19.0
+pyyaml==5.1

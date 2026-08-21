@@ -1,0 +1,100 @@
+# Architecture manifest for the fixture project. Deliberately weak so that the
+# deterministic architecture rules have something to fire on.
+system:
+  name: Telemetry Ingest (fixture)
+  version: "0.9"
+  owner: platform-team
+  classification: confidential
+  description: Ingests device telemetry and renders a UAT dashboard.
+
+trust_boundaries:
+  - id: tb-device
+    name: Device LAN to collector
+    description: ESP32 devices on the customer network reaching the collector.
+    controls: []
+
+components:
+  - id: collector
+    name: Telemetry collector
+    type: service
+    trust_zone: dmz
+    authentication: none
+    authorization: none
+    internet_facing: true
+    handles_sensitive_data: true
+
+  - id: web-ui
+    name: UAT dashboard
+    type: service
+    trust_zone: dmz
+    authentication: none
+    authorization: none
+    internet_facing: true
+    handles_sensitive_data: true
+
+data_flows:
+  - id: df-device-collector
+    name: Device telemetry
+    source: device
+    destination: collector
+    data: [telemetry, device-identifier]
+    classification: confidential
+    crosses_boundary: tb-device
+    encryption_in_transit: none
+    authentication: none
+
+data_stores:
+  - id: telemetry-db
+    name: SQLite telemetry store
+    classification: confidential
+    contains_pii: true
+    encryption_at_rest: none
+    backup: false
+
+integrations:
+  - id: cloud-forwarder
+    name: Cloud telemetry forwarder
+    provider: Example Cloud
+    data_shared: [telemetry]
+    authentication: none
+    transport: http
+
+secrets:
+  management: env-file
+  rotation: none
+  storage_locations:
+    - .env on the application host
+
+exposure:
+  - id: uat-dashboard
+    component: web-ui
+    url: http://uat.example.com
+    environment: uat
+    network: internet
+    authentication: none
+    tls: false
+    waf: false
+
+logging:
+  security_events: false
+  centralised: false
+  pii_redaction: false
+
+threat_model:
+  performed: true
+  methodology: STRIDE
+  date: "2026-07-01"
+  reviewed_by: platform-team
+  threats:
+    - id: T-01
+      stride: spoofing
+      description: A rogue device publishes fabricated telemetry.
+      mitigation: ""
+      status: open
+      owner: platform-team
+    - id: T-02
+      stride: information_disclosure
+      description: Telemetry readable in transit on the customer LAN.
+      mitigation: Planned TLS termination at the collector.
+      status: planned
+      owner: platform-team

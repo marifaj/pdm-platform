@@ -1,0 +1,11 @@
+# MARKNA scratch and output directories.
+.markna/
+markna-reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/

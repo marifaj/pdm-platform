@@ -1,0 +1,28 @@
+# Scanners MARKNA drives, installable with pip.
+#
+#   pip install -r requirements-scanners.txt
+#
+# Everything here is optional: a scanner that is not installed is reported as a
+# coverage gap in the assessment rather than silently skipped. Install what your
+# runner can support and let the policy tell you what is still missing.
+
+semgrep>=1.60          # SAST (multi-language); ships MARKNA's offline baseline rules
+bandit>=1.7            # SAST (Python), fully offline
+pip-audit>=2.7         # Python dependency vulnerabilities (PyPI/OSV)
+detect-secrets>=1.4    # Secret detection
+cyclonedx-bom>=4.0     # CycloneDX SBOM for Python requirement files
+
+# Not installed here on purpose:
+#
+#   checkov          — pins dependency versions that clash with cyclonedx-bom.
+#                      Install it in its own environment: pipx install checkov
+#                      and point MARKNA at it with --tool-path.
+#
+# Binaries that are worth installing separately (each unlocks more coverage than
+# anything above; MARKNA finds them on PATH or via --tool-path):
+#
+#   gitleaks         — secrets, including git history   https://github.com/gitleaks/gitleaks
+#   trivy            — dependencies + secrets + IaC     https://github.com/aquasecurity/trivy
+#   syft             — multi-ecosystem SBOM             https://github.com/anchore/syft
+#   osv-scanner      — multi-ecosystem dependencies     https://github.com/google/osv-scanner
+#   docker           — required by the OWASP ZAP baseline scan
