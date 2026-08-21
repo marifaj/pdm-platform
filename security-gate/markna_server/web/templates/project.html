@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} — MARKNA{% endblock %}
+{% block content %}
+<h1>{{ project.name }}</h1>
+<p class="sub"><code>{{ project.slug }}</code> · {{ project.description or 'no description' }}</p>
+
+<h2>Inputs</h2>
+<table>
+  <tbody>
+    <tr><th>Source path</th><td><code>{{ project.source.local_path or '—' }}</code></td></tr>
+    <tr><th>Repository</th><td>{{ project.source.url or '—' }} <span class="muted">({{ project.source.default_branch }})</span></td></tr>
+    <tr><th>Architecture manifest</th><td><code>{{ project.architecture_manifest or '—' }}</code></td></tr>
+    <tr><th>Architecture documents</th><td>{% for doc in project.architecture_documents %}<code>{{ doc }}</code><br>{% else %}—{% endfor %}</td></tr>
+    <tr><th>Assessable layers</th><td>{{ layers|join(', ') or 'nothing configured' }}</td></tr>
+    <tr><th>Policy in force</th><td>
+      {% if policy %}<code>{{ policy.name }}</code> v{{ policy.version }} ({{ policy.scope_label }} scope)
+      {% else %}<span class="muted">engine default (no policy stored)</span>{% endif %}
+    </td></tr>
+  </tbody>
+</table>
+
+<h2>Environment targets</h2>
+{% if targets %}
+<table>
+  <thead><tr><th>Name</th><th>URL</th><th>Kind</th><th>Authorised by</th><th>Expires</th>{% if can_write %}<th></th>{% endif %}</tr></thead>
+  <tbody>
+  {% for target in targets %}
+    <tr>
+      <td>{{ target.name }}</td>
+      <td><code>{{ target.url }}</code></td>
+      <td>{{ target.kind.value }}</td>
+      <td>{{ target.authorized_by }}{% if target.authorization_reference %} <span class="muted">({{ target.authorization_reference }})</span>{% endif %}</td>
+      <td class="muted">{{ target.authorization_expires or 'no expiry' }}</td>
+      {% if can_write %}
+      <td class="right">
+        <form class="inline" method="post" action="/targets/{{ target.id }}/delete">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="secondary" type="submit">Remove</button>
+        </form>
+      </td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No environment targets. The environment layer cannot run without one, because
+  probing a deployed system requires a recorded authorisation.</p>
+{% endif %}
+
+{% if can_write %}
+<h3>Add a target</h3>
+<form method="post" action="/projects/{{ project.id }}/targets">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <fieldset>
+    <legend>Environment</legend>
+    <label for="tname">Name</label>
+    <input id="tname" name="name" type="text" required placeholder="UAT">
+    <label for="turl">URL</label>
+    <input id="turl" name="url" type="url" required placeholder="https://uat.example.com">
+    <label for="tkind">Kind</label>
+    <select id="tkind" name="kind">
+      {% for kind in environment_kinds %}<option value="{{ kind }}">{{ kind }}</option>{% endfor %}
+    </select>
+  </fieldset>
+  <fieldset>
+    <legend>Authorisation — required before any traffic is sent</legend>
+    <label for="authorized_by">Authorised by</label>
+    <input id="authorized_by" name="authorized_by" type="text" required placeholder="J. Smith, Platform Lead">
+    <label for="auth_reference">Reference (change ticket)</label>
+    <input id="auth_reference" name="authorization_reference" type="text" placeholder="CHG-4821">
+    <label for="auth_expires">Expires (YYYY-MM-DD)</label>
+    <input id="auth_expires" name="authorization_expires" type="text" placeholder="2026-12-31">
+    <label for="scope_hosts">Additional in-scope hosts, comma separated</label>
+    <input id="scope_hosts" name="scope_hosts" type="text">
+    <label><input type="checkbox" name="allow_private_targets" value="1"> Permit private/loopback addresses (internal UAT)</label>
+    <p><button type="submit">Add target</button></p>
+  </fieldset>
+</form>
+{% endif %}
+
+{% if can_run %}
+<h2>Queue an assessment</h2>
+<form method="post" action="/projects/{{ project.id }}/runs">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <fieldset>
+    <legend>Layers</legend>
+    {% for layer in layers %}
+      <label><input type="checkbox" name="layers" value="{{ layer }}" checked> {{ layer }}</label>
+    {% else %}
+      <p class="muted">Nothing to assess: add a source path, an architecture manifest, or a target.</p>
+    {% endfor %}
+    {% if targets %}
+      <label for="target_id">Environment target</label>
+      <select id="target_id" name="target_id">
+        {% for target in targets %}<option value="{{ target.id }}">{{ target.name }} — {{ target.url }}</option>{% endfor %}
+      </select>
+    {% endif %}
+    {% if layers %}<p><button type="submit">Queue run</button></p>
+    <p class="muted">The run is queued here and executed by a worker process. Scanners never run
+      inside the web process.</p>{% endif %}
+  </fieldset>
+</form>
+{% endif %}
+
+<h2>Runs</h2>
+{% if runs %}
+<table>
+  <thead><tr><th>Run</th><th>Status</th><th>Verdict</th><th>Blocking</th><th>Created</th><th>Duration</th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td><a href="/runs/{{ run.id }}"><code>{{ run.id }}</code></a></td>
+      <td>{{ run.status.value }}</td>
+      <td><span class="pill v-{{ run.verdict.value if run.verdict else 'none' }}">{{ run.verdict.value if run.verdict else '—' }}</span></td>
+      <td>{{ run.blocking_count() }}</td>
+      <td class="muted">{{ run.created_at }}</td>
+      <td class="muted">{{ '%.1fs'|format(run.duration_seconds) if run.duration_seconds else '—' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">No runs yet.</p>{% endif %}
+{% endblock %}

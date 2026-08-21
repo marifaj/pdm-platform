@@ -1,13 +1,23 @@
 # MARKNA Security Gate
 
-An independent security review that runs before a project reaches UAT or
-production, across three layers:
+A server-hosted web application that runs an independent security review of a
+software project before it reaches UAT or production, across three layers:
 
 | Layer | What it assesses | How |
 | --- | --- | --- |
 | **Architecture** | Trust boundaries, authn/authz, sensitive-data flows, external integrations, secrets handling, deployment exposure, threat model | A deterministic rule engine over a structured architecture manifest, plus a topic-coverage checklist and stated-risk extraction over the design documents |
 | **Code** | SAST, dependency vulnerabilities, secrets, SBOM, insecure configuration, common OWASP weaknesses | Mature open-source scanners (Semgrep, Bandit, Gitleaks, detect-secrets, Trivy, pip-audit, OSV-Scanner, npm audit, Checkov, Syft, cyclonedx-py) |
 | **Environment** | TLS and certificates, security headers, cookie attributes, CORS, exposed paths, enabled HTTP methods, passive DAST | Read-only probes from the standard library, plus an OWASP ZAP baseline scan |
+
+It is two processes over one database: a web process that serves the UI and the
+JSON API, and a worker process that actually runs the scanners. Queueing a run
+writes a row; the web process never executes a scanner.
+
+**v1.0 is single-organisation and internal** — no billing, no signup, no tenant
+selection. The data model, the access checks and the process boundaries are
+nonetheless tenant-shaped throughout, so those options stay open. See
+[`docs/architecture.md`](docs/architecture.md) for the boundaries and for what
+productisation would actually involve.
 
 Every run ends in one of three verdicts:
 
@@ -37,7 +47,7 @@ return PASS.
 ## Install
 
 ```bash
-pip install ./security-gate                        # the gate itself (stdlib + PyYAML)
+pip install ./security-gate                        # engine + server
 pip install -r security-gate/requirements-scanners.txt   # the pip-installable scanners
 ```
 
@@ -49,7 +59,64 @@ variable. Check what the runner actually has:
 markna scanners
 ```
 
-## Quick start
+## Running the server
+
+```bash
+markna-server initdb
+markna-server bootstrap --org-slug acme --org-name "Acme" \
+  --admin-email security@acme.example --admin-password '…'
+
+# web process — a plain WSGI callable, so any WSGI server works
+gunicorn -w 4 -b 127.0.0.1:8080 markna_server.app:application
+# ...or, for local work only:
+markna-server serve
+
+# worker process — one or more; this is where scanners run
+markna-server worker
+```
+
+Then sign in, create a project, and queue an assessment. A project points at a
+source path, architecture documents and a manifest — all resolved inside a
+configured `workspace_root` and refused if they escape it — plus any number of
+authorised environment targets.
+
+```bash
+# The same thing over the API
+TOKEN=$(markna-server token create --name ci | sed -n 2p)
+curl -sX POST localhost:8080/api/v1/projects/$PROJECT/runs \
+  -H "Authorization: Bearer $TOKEN" -d '{"layers":["architecture","code"]}'
+# -> 202 {"status":"queued", ...}
+```
+
+`markna-server status` shows configuration, projects and queue state;
+`markna-server --help` lists user, token, project and policy management.
+
+### Concepts
+
+| Concept | What it is |
+| --- | --- |
+| **Organization** | The tenant boundary. Every other record belongs to exactly one. |
+| **Project** | One assessed system: source, architecture material, targets, policy. |
+| **AssessmentRun** | One execution against one project under one policy version. Also the queue entry. |
+| **Finding** | One observation belonging to a run, in the engine's schema. |
+| **Policy** | Versioned release rules. Project overrides organisation overrides engine default. |
+| **Report** | A rendered artefact of a run, in one format. |
+
+Access is role-based (`viewer`, `maintainer`, `admin`) and every service call
+resolves its tenant scope from the caller's principal — no endpoint accepts an
+`organization_id`. A cross-tenant lookup returns 404, never 403.
+
+Authentication is a protocol with a registry: API tokens and browser sessions
+ship in v1.0, and a third provider trusts identity headers from an
+authenticating reverse proxy — which is how an Entra ID deployment works today
+without changing any application code. Adding a native OIDC provider is one
+class and one registry entry; the `users` table already carries `subject` and
+`issuer` columns for exactly that.
+
+## Using the engine directly
+
+The scanner engine is a standalone CLI, unchanged and independent of the server
+— useful in CI, or for a one-off assessment:
 
 ```bash
 markna init                    # writes markna.yaml, markna-policy.yaml, architecture.yaml
@@ -303,29 +370,47 @@ URL exists.
 ```bash
 cd security-gate
 pip install -e ".[dev]"
-pytest                     # 145 tests, no external scanners required
+pytest                     # 261 tests, no external scanners or network required
 ```
 
-The test suite covers the finding model, the policy engine's verdict and
-coverage logic, redaction, both architecture engines, the environment scanners
-(against a local throwaway HTTP server), all four report formats, and the CLI's
-exit-code contract.
+The suite covers the finding model, the policy engine's verdict and coverage
+logic, redaction, both architecture engines, the environment scanners (against a
+local throwaway HTTP server), all four report formats, the CLI exit-code
+contract, tenant isolation, the HTTP surfaces end to end, and the queue.
+
+`tests/test_layering.py` enforces the architecture rather than describing it: it
+parses the import graph and fails if a user-facing module reaches the scanner
+engine, if the domain learns how it is stored, if a tenant-scoped repository
+method loses its scope parameter, or if any module hard-codes an organisation or
+project id.
 
 Layout:
 
 ```
-markna/
-├── models.py          Finding / ScannerRun / Assessment, ids and fingerprints
-├── policy.py          verdict, coverage requirements, suppressions, overrides
-├── runner.py          orchestration; isolates scanner failures
-├── authorization.py   environment authorisation and scope enforcement
-├── http.py            read-only, scope-checked HTTP client
-├── redact.py          credential redaction for evidence
-├── exec.py            bounded subprocess execution and tool discovery
-├── scanners/          one adapter per tool; each declares its capabilities
-├── rules/semgrep/     bundled offline SAST ruleset
-├── ai/                Anthropic reasoning layer (advisory)
-└── report/            json / markdown / sarif / html
+markna/                    the scanner engine — standalone, no server imports
+├── models.py              Finding / ScannerRun / Assessment, ids and fingerprints
+├── policy.py              verdict, coverage requirements, suppressions, overrides
+├── runner.py              orchestration; isolates scanner failures
+├── authorization.py       environment authorisation and scope enforcement
+├── http.py                read-only, scope-checked HTTP client
+├── redact.py              credential redaction for evidence
+├── exec.py                bounded subprocess execution and tool discovery
+├── scanners/              one adapter per tool; each declares its capabilities
+├── rules/semgrep/         bundled offline SAST ruleset
+├── ai/                    Anthropic reasoning layer (advisory)
+└── report/                json / markdown / sarif / html
+
+markna_server/             the web application
+├── domain/                entities, ids, errors — no I/O
+├── identity/              principals, roles, pluggable authentication, access control
+├── storage/               repository protocols + SQLite implementation + schema
+├── service.py             application services; the only place access is enforced
+├── execution/             the queue worker and the engine adapter (separate process)
+├── api/                   JSON API v1 and the WSGI core
+├── web/                   server-rendered UI (no JavaScript, strict CSP)
+├── config.py              configuration and workspace path confinement
+├── app.py                 the WSGI application
+└── cli.py                 provisioning, serve, worker
 ```
 
 Adding a scanner: subclass `Scanner`, declare `layer` and `capabilities`,

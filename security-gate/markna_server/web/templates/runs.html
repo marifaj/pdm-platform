@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Runs</h1>
+<p class="sub">All assessment runs in {{ organization.name }}.</p>
+<table>
+  <thead><tr><th>Run</th><th>Project</th><th>Status</th><th>Verdict</th><th>Blocking</th><th>Layers</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td><a href="/runs/{{ run.id }}"><code>{{ run.id }}</code></a></td>
+      <td>{{ project_names.get(run.project_id, run.project_id) }}</td>
+      <td>{{ run.status.value }}</td>
+      <td><span class="pill v-{{ run.verdict.value if run.verdict else 'none' }}">{{ run.verdict.value if run.verdict else '—' }}</span></td>
+      <td>{{ run.blocking_count() }}</td>
+      <td class="muted">{{ run.layers|map(attribute='value')|join(', ') }}</td>
+      <td class="muted">{{ run.created_at }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="muted">No runs yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

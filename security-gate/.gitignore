@@ -9,3 +9,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Server runtime state
+markna.db
+markna.db-wal
+markna.db-shm
+workspaces/
+work/

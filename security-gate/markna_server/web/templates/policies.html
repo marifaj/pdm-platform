@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Policies</h1>
+<p class="sub">A policy decides what blocks a release. Versions are immutable: a change creates a
+  new version, so every run records exactly which rules judged it.</p>
+<table>
+  <thead><tr><th>Name</th><th>Version</th><th>Scope</th><th>Default</th><th>Blocks on</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for policy in policies %}
+    <tr>
+      <td>{{ policy.name }}</td>
+      <td>v{{ policy.version }}</td>
+      <td>{{ policy.scope_label }}{% if policy.project_id %} <span class="muted">({{ project_names.get(policy.project_id, policy.project_id) }})</span>{% endif %}</td>
+      <td>{{ 'yes' if policy.is_default else '' }}</td>
+      <td class="muted">{{ policy.document.get('block_on', ['critical','high'])|join(', ') }}</td>
+      <td class="muted">{{ policy.created_at }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No stored policies — runs use the engine default.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted">Policy documents are edited through the API
+  (<code>POST /api/v1/policies</code>) or the <code>markna-server policy import</code> command;
+  v1.0 has no policy editor in the UI.</p>
+{% endblock %}

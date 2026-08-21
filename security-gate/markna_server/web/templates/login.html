@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Sign in — MARKNA{% endblock %}
+{% block content %}
+<h1>Sign in</h1>
+<p class="sub">{{ organization.name if organization else 'MARKNA Security Gate' }}</p>
+{% if error %}<div class="notice error">{{ error }}</div>{% endif %}
+<form method="post" action="/login">
+  <fieldset>
+    <legend>Credentials</legend>
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="username" required value="{{ email }}">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <p><button type="submit">Sign in</button></p>
+  </fieldset>
+</form>
+<p class="muted">
+  Local accounts are the built-in option. An external identity provider — Entra ID or any
+  OIDC issuer — is added by configuring an authentication provider, not by changing this page.
+</p>
+{% endblock %}

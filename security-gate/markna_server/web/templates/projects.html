@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Projects</h1>
+<p class="sub">Every project belongs to {{ organization.name }} and is assessed independently.</p>
+
+{% if projects %}
+<table>
+  <thead><tr><th>Name</th><th>Slug</th><th>Assessable layers</th><th>Latest verdict</th><th></th></tr></thead>
+  <tbody>
+  {% for row in projects %}
+    <tr>
+      <td><a href="/projects/{{ row.project.id }}">{{ row.project.name }}</a></td>
+      <td><code>{{ row.project.slug }}</code></td>
+      <td class="muted">{{ row.layers|join(', ') or '— nothing configured yet' }}</td>
+      <td>
+        {% if row.latest %}
+          <a href="/runs/{{ row.latest.id }}"><span class="pill v-{{ row.latest.verdict.value if row.latest.verdict else 'none' }}">{{ row.latest.verdict.value if row.latest.verdict else row.latest.status.value }}</span></a>
+        {% else %}<span class="muted">never assessed</span>{% endif %}
+      </td>
+      <td class="right muted">{{ row.run_count }} run(s)</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No projects yet.</p>
+{% endif %}
+
+{% if can_write %}
+<h2>New project</h2>
+<form method="post" action="/projects">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <fieldset>
+    <legend>Identity</legend>
+    <label for="slug">Slug</label>
+    <input id="slug" name="slug" type="text" required placeholder="pdm-platform">
+    <label for="name">Name</label>
+    <input id="name" name="name" type="text" required placeholder="PdM Platform">
+    <label for="description">Description</label>
+    <input id="description" name="description" type="text">
+  </fieldset>
+  <fieldset>
+    <legend>Inputs</legend>
+    <p class="muted">Paths are relative to the server workspace root <code>{{ workspace_root }}</code>
+      and cannot escape it.</p>
+    <label for="local_path">Source path (code layer)</label>
+    <input id="local_path" name="local_path" type="text" placeholder="pdm-platform/src">
+    <label for="repo_url">Repository URL (recorded, not cloned in v1.0)</label>
+    <input id="repo_url" name="repo_url" type="url" placeholder="https://github.com/org/repo">
+    <label for="architecture_manifest">Architecture manifest (architecture layer)</label>
+    <input id="architecture_manifest" name="architecture_manifest" type="text" placeholder="pdm-platform/architecture.yaml">
+    <label for="architecture_documents">Architecture documents, comma separated</label>
+    <input id="architecture_documents" name="architecture_documents" type="text" placeholder="pdm-platform/docs/architecture.md">
+    <p><button type="submit">Create project</button></p>
+  </fieldset>
+</form>
+{% endif %}
+{% endblock %}

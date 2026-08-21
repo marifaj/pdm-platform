@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Dashboard</h1>
+<p class="sub">{{ organization.name }} · {{ summary.projects }} project(s)</p>
+
+<div class="cards">
+  <div class="card"><div class="n">{{ summary.by_verdict.PASS }}</div><div class="k">Pass</div></div>
+  <div class="card"><div class="n">{{ summary.by_verdict.WARN }}</div><div class="k">Warn</div></div>
+  <div class="card"><div class="n">{{ summary.by_verdict.BLOCK }}</div><div class="k">Block</div></div>
+  <div class="card"><div class="n">{{ summary.by_status.queued + summary.by_status.running }}</div><div class="k">In flight</div></div>
+  <div class="card"><div class="n">{{ summary.blocking_findings }}</div><div class="k">Blocking findings</div></div>
+</div>
+
+<h2>Recent runs</h2>
+{% if runs %}
+<table>
+  <thead><tr><th>Run</th><th>Project</th><th>Status</th><th>Verdict</th><th>Layers</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td><a href="/runs/{{ run.id }}"><code>{{ run.id }}</code></a></td>
+      <td>{{ project_names.get(run.project_id, run.project_id) }}</td>
+      <td>{{ run.status.value }}</td>
+      <td><span class="pill v-{{ run.verdict.value if run.verdict else 'none' }}">{{ run.verdict.value if run.verdict else '—' }}</span></td>
+      <td class="muted">{{ run.layers|map(attribute='value')|join(', ') }}</td>
+      <td class="muted">{{ run.created_at }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No runs yet. Create a project, then queue an assessment.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Run {{ detail.run.id }} — MARKNA{% endblock %}
+{% block content %}
+<h1>
+  <span class="pill v-{{ detail.run.verdict.value if detail.run.verdict else 'none' }}">{{ detail.run.verdict.value if detail.run.verdict else detail.run.status.value|upper }}</span>
+  {{ detail.project.name }}
+</h1>
+<p class="sub"><code>{{ detail.run.id }}</code> · policy <code>{{ detail.run.policy_name }}</code> ·
+  {{ detail.run.layers|map(attribute='value')|join(', ') }} ·
+  triggered by {{ detail.run.trigger.actor_label }} ({{ detail.run.trigger.kind.value }})</p>
+
+{% if detail.run.error %}<div class="notice error"><strong>Run failed.</strong> {{ detail.run.error }}</div>{% endif %}
+
+{% if detail.run.verdict_reasons %}
+<ul>{% for reason in detail.run.verdict_reasons %}<li>{{ reason }}</li>{% endfor %}</ul>
+{% endif %}
+
+{% if detail.run.status.value in ('queued', 'running') %}
+<div class="notice">This run is {{ detail.run.status.value }}. Reload the page for progress —
+  the worker updates it independently of this process.
+  {% if detail.run.status.value == 'queued' and can_cancel %}
+  <form class="inline" method="post" action="/runs/{{ detail.run.id }}/cancel">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button class="secondary" type="submit">Cancel</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+{% set counts = detail.run.summary.get('by_severity', {}) %}
+{% if counts %}
+<div class="cards">
+  {% for severity in ['critical','high','medium','low','info'] %}
+    <div class="card"><div class="n s-{{ severity }}">{{ counts.get(severity, 0) }}</div><div class="k">{{ severity }}</div></div>
+  {% endfor %}
+  <div class="card"><div class="n">{{ detail.run.summary.get('blocking_findings', 0) }}</div><div class="k">blocking</div></div>
+  <div class="card"><div class="n">{{ detail.run.summary.get('advisory_ai_findings', 0) }}</div><div class="k">AI advisory</div></div>
+</div>
+{% endif %}
+
+<h2>Evidence coverage</h2>
+{% if detail.coverage %}
+<table>
+  <thead><tr><th>Layer</th><th>Capability</th><th>Covered</th><th>Provided by</th></tr></thead>
+  <tbody>
+  {% for entry in detail.coverage %}
+    <tr>
+      <td>{{ entry.layer.value }}</td>
+      <td><code>{{ entry.capability }}</code></td>
+      <td>{% if entry.satisfied %}yes{% else %}<span class="s-high">NO</span>{% endif %}</td>
+      <td class="muted">{{ entry.satisfied_by|join(', ') or '—' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">No coverage record (the run has not completed).</p>{% endif %}
+
+<h2>Findings <span class="muted">({{ detail.findings|length }} shown of {{ detail.total_findings }})</span></h2>
+<form method="get">
+  <label for="severity">Filter</label>
+  <select id="severity" name="severity">
+    <option value="">all severities</option>
+    {% for severity in ['critical','high','medium','low','info'] %}
+      <option value="{{ severity }}" {% if filters.severity == severity %}selected{% endif %}>{{ severity }}</option>
+    {% endfor %}
+  </select>
+  <select name="layer">
+    <option value="">all layers</option>
+    {% for layer in ['architecture','code','environment'] %}
+      <option value="{{ layer }}" {% if filters.layer == layer %}selected{% endif %}>{{ layer }}</option>
+    {% endfor %}
+  </select>
+  <label><input type="checkbox" name="blocking" value="1" {% if filters.blocking %}checked{% endif %}> blocking only</label>
+  <button class="secondary" type="submit">Apply</button>
+</form>
+
+{% for finding in detail.findings %}
+<div style="border:1px solid var(--line); border-left:4px solid currentColor; border-radius:.35rem; padding:.75rem 1rem; margin:.75rem 0;" class="s-{{ finding.severity.value }}">
+  <h3 style="margin-top:0;">
+    {% if finding.blocking %}<span class="tag">BLOCKING</span>{% endif %}
+    {% if finding.ai_generated %}<span class="tag ai">AI ADVISORY</span>{% endif %}
+    <code>{{ finding.engine_id }}</code> {{ finding.title }}
+  </h3>
+  <p class="muted" style="color:var(--muted);">
+    {{ finding.severity.value }} · {{ finding.layer.value }} · {{ finding.source }}
+    {% if finding.rule_id %}· <code>{{ finding.rule_id }}</code>{% endif %}
+    · <code>{{ finding.location.describe() }}</code>
+    · confidence {{ finding.confidence }}
+    {% if finding.cwe %}· {{ finding.cwe|join(', ') }}{% endif %}
+  </p>
+  <p style="color:var(--fg);">{{ finding.explanation }}</p>
+  {% if finding.evidence %}<pre>{{ finding.evidence }}</pre>{% endif %}
+  {% if finding.remediation %}<p style="color:var(--fg);"><strong>Remediation.</strong> {{ finding.remediation }}</p>{% endif %}
+</div>
+{% else %}
+<p class="muted">No findings match this filter.</p>
+{% endfor %}
+
+<h2>Scanner execution record</h2>
+{% if detail.scanner_runs %}
+<table>
+  <thead><tr><th>Scanner</th><th>Layer</th><th>Status</th><th>Kind</th><th>Findings</th><th>Duration</th><th>Detail</th></tr></thead>
+  <tbody>
+  {% for record in detail.scanner_runs %}
+    <tr>
+      <td>{{ record.name }}</td><td>{{ record.layer.value }}</td><td>{{ record.status }}</td>
+      <td class="muted">{{ 'deterministic' if record.deterministic else 'AI advisory' }}</td>
+      <td>{{ record.findings_count }}</td><td class="muted">{{ '%.1fs'|format(record.duration_seconds) }}</td>
+      <td class="muted">{{ record.message or record.tool_version or '' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">No scanner records yet.</p>{% endif %}
+
+<h2>Reports</h2>
+{% if detail.reports %}
+<p>{% for report in detail.reports %}
+  <a href="/runs/{{ detail.run.id }}/reports/{{ report.format }}">{{ report.format }}</a>
+  <span class="muted">({{ report.size_bytes }} bytes)</span>{% if not loop.last %} · {% endif %}
+{% endfor %}</p>
+{% else %}<p class="muted">No reports (the run has not completed).</p>{% endif %}
+{% endblock %}
