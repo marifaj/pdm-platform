@@ -30,6 +30,8 @@ environment:
     reference: ""            # change ticket / engagement reference
     expires: ""              # YYYY-MM-DD; the gate refuses to run after this date
     scope_hosts: []          # extra hosts in scope (the target host is always included)
+    authorized_ports: []     # extra ports in scope (the target URL's own port is always
+                             # included; a host grant does not authorise every service on it)
     allow_private_targets: false   # set true for an internal UAT host (RFC1918/loopback)
     note: ""
 

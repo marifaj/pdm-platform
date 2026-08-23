@@ -51,20 +51,20 @@ class TestConnectTimeDestinationEnforcement:
     def test_a_loopback_address_is_refused_at_connect_time(self, local_server):
         """The hostname passed the earlier check; the resolved address does not."""
         host, port = local_server
-        scope = Scope(hosts=["localhost", "127.0.0.1"], allow_private=False)
-        with pytest.raises(ScopeError):
+        scope = Scope(hosts=["localhost", "127.0.0.1"], ports=[port], allow_private=False)
+        with pytest.raises(ScopeError, match="non-public|out-of-scope address"):
             _guarded_socket("127.0.0.1", port, 5.0, None, scope)
 
     def test_a_name_resolving_to_loopback_is_refused(self, local_server):
         """This is the DNS-rebinding shape: the name is allowed, the answer is not."""
         _, port = local_server
-        scope = Scope(hosts=["localhost"], allow_private=False)
-        with pytest.raises(ScopeError):
+        scope = Scope(hosts=["localhost"], ports=[port], allow_private=False)
+        with pytest.raises(ScopeError, match="non-public|out-of-scope address"):
             _guarded_socket("localhost", port, 5.0, None, scope)
 
     def test_an_authorised_internal_target_still_connects(self, local_server):
         host, port = local_server
-        scope = Scope(hosts=["127.0.0.1"], allow_private=True)
+        scope = Scope(hosts=["127.0.0.1"], ports=[port], allow_private=True)
         connection = _guarded_socket(host, port, 5.0, None, scope)
         try:
             assert connection.getpeername()[1] == port
@@ -81,9 +81,9 @@ class TestConnectTimeDestinationEnforcement:
 
     def test_the_client_refuses_the_same_target_without_that_permission(self, local_server):
         host, port = local_server
-        scope = Scope(hosts=[host], allow_private=False)
+        scope = Scope(hosts=[host], ports=[port], allow_private=False)
         client = HttpClient(scope, rate_limit_seconds=0)
-        with pytest.raises(ScopeError):
+        with pytest.raises(ScopeError, match="private, loopback"):
             client.get(f"http://{host}:{port}/")
 
 

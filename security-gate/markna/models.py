@@ -314,6 +314,10 @@ class Target:
     name: Optional[str] = None
     git_commit: Optional[str] = None
     git_branch: Optional[str] = None
+    #: Why the commit above is absent or incomplete, when a repository was
+    #: present but its history could not be trusted as this project's own. A
+    #: refused provenance must never render as "no repository".
+    git_provenance_note: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -324,6 +328,7 @@ class Target:
             "environment_url": self.environment_url,
             "git_commit": self.git_commit,
             "git_branch": self.git_branch,
+            "git_provenance_note": self.git_provenance_note,
         }
 
 

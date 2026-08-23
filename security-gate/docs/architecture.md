@@ -301,7 +301,28 @@ A gate that checks other systems for these has to have them.
   the host itself, vets each candidate address, and connects to an address that
   has already been approved. Checking a hostname and then letting the socket
   resolve it again leaves a window in which the answer can change; this closes
-  it.
+  it. The port is re-checked in the same place, on the port the socket will
+  genuinely dial, so anything that reaches a socket without passing
+  `Scope.check` still stops there.
+* **Scope has two dimensions, host and port** — an authorisation names a
+  machine *and* the services on it. The target URL's own port is in scope by
+  the act of naming it; every other port needs `authorized_ports`. Without
+  this, a 302 from an authorised UAT application to `:2375` on the same host
+  turned a web-application authorisation into a container-runtime probe, which
+  is a different system with a different owner. Because the default port moves
+  with the scheme, an `http` grant is not an `https` grant.
+* **Repository provenance is read, not discovered** — the commit recorded in a
+  report is evidence, so the repository under assessment must not be able to
+  choose it. `markna/provenance.py` reads `HEAD` and the ref it names from
+  `<project>/.git` through a held directory descriptor, with every path
+  component inspected, opened without following links, and re-checked by inode
+  so a component swapped between the two operations is refused. No `git`
+  process runs against the assessed tree, so discovery cannot walk upward into
+  a parent, a `gitdir:` pointer or symlinked `.git` cannot name someone else's
+  history, and repository-controlled configuration has no bearing on the
+  answer. A history that lives elsewhere is refused with a stated reason that
+  is rendered in the report — a provenance that could not be established must
+  not read as "no repository".
 * **Request parsing inside the error boundary** — a negative or non-numeric
   `Content-Length` is a 400, not an exception escaping the WSGI callable, and
   the body limit is enforced on the read rather than trusting the header.

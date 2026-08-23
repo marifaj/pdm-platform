@@ -61,6 +61,8 @@ def _metadata_section(assessment: Assessment) -> List[str]:
         ("Project path", target.project_path or "not assessed"),
         ("Git commit", target.git_commit or "n/a"),
         ("Git branch", target.git_branch or "n/a"),
+        # A refused provenance must not be indistinguishable from no repository.
+        ("Git provenance", target.git_provenance_note or "read from the project's own .git"),
         ("Architecture documents", ", ".join(target.architecture_docs) or "none"),
         ("Architecture manifest", target.architecture_manifest or "none"),
         ("Environment URL", target.environment_url or "not assessed"),

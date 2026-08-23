@@ -100,6 +100,13 @@ def _add_assess_arguments(parser: argparse.ArgumentParser) -> None:
         help="additional in-scope host; repeatable",
     )
     auth.add_argument(
+        "--authorized-port", action="append", default=[], type=int, metavar="PORT",
+        help=(
+            "additional in-scope port on the in-scope hosts; repeatable. The target URL's own "
+            "port is always in scope; every other service on that host is not."
+        ),
+    )
+    auth.add_argument(
         "--allow-private-targets", action="store_true",
         help="permit RFC1918 / loopback targets (internal UAT hosts)",
     )
@@ -376,6 +383,8 @@ def _build_authorization(
         "reference": args.auth_reference or from_file.get("reference"),
         "expires": args.auth_expires or from_file.get("expires"),
         "scope_hosts": list(args.scope_host) + list(from_file.get("scope_hosts") or []),
+        "authorized_ports": list(args.authorized_port)
+        + list(from_file.get("authorized_ports") or []),
         "allow_private_targets": args.allow_private_targets
         or bool(from_file.get("allow_private_targets", False)),
     }

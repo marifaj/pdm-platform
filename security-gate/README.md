@@ -303,6 +303,21 @@ Semgrep applies its own ignore list (test directories, vendored code), so
 MARKNA records how many files were actually analysed as an INFO finding. A "no
 findings" result means nothing without knowing what was looked at.
 
+**Repository provenance.** The commit and branch in the report are evidence: a
+release record points at that line months later to say what was reviewed. They
+are read from `<project>/.git` directly — `HEAD` and the ref it names, through a
+descriptor held on that directory — rather than by running `git` inside the
+repository under assessment. Running git there means asking a program whose job
+is to *search* for a repository, and the search is steerable by the thing being
+assessed: `.git` can be a symlink or a `gitdir:` pointer naming an unrelated
+repository, and discovery walks upward into a parent that was never in scope.
+
+The consequence is that a repository whose history lives somewhere else —
+worktrees, `commondir` delegation, submodule pointers — is **refused rather than
+resolved**, and the refusal is printed in the report next to the commit. A
+provenance that could not be established must not be indistinguishable from a
+directory that is not a repository at all.
+
 ## Environment layer
 
 This layer sends traffic to a running system, so it is gated:
@@ -313,6 +328,16 @@ This layer sends traffic to a running system, so it is gated:
 - **Scope is enforced on every request, including redirects.** Only the target
   host and any `--scope-host` you add are reachable; a redirect out of scope
   aborts the scanner rather than following it.
+- **Scope covers ports as well as hosts.** A host grant is not a grant over
+  every service listening on that host: the same name commonly carries an
+  unauthenticated admin API, a metrics endpoint or a container runtime socket
+  alongside the web application you were asked to review. The target URL's own
+  port is in scope by the act of naming it; anything else needs
+  `--authorized-port` (or `authorized_ports` in the config file). A redirect to
+  another port on the authorised host is refused exactly as a redirect to
+  another host is, and the port is re-checked at connect time on the port the
+  socket will genuinely dial. Note that changing scheme changes the port:
+  `http://uat.example/` does not authorise `https://uat.example/`.
 - **Private and loopback targets are refused** unless
   `--allow-private-targets` is set, so a typo cannot point the gate at an
   internal host by accident.
@@ -430,6 +455,7 @@ markna/                    the scanner engine — standalone, no server imports
 ├── redact.py              credential redaction for evidence
 ├── exec.py                bounded subprocess execution; allow-listed environment
 ├── confinement.py         workspace confinement: traversal, reads, reporting
+├── provenance.py          the assessed repository's own commit, read without git
 ├── scanners/              one adapter per tool; each declares its capabilities
 ├── rules/semgrep/         bundled offline SAST ruleset
 ├── ai/                    Anthropic reasoning layer (advisory)

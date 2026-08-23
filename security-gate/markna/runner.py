@@ -12,11 +12,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional
 
 from .authorization import Authorization, AuthorizationError, Scope, ScopeError
 from .confinement import confine_findings, escaping_symlink_finding, find_escaping_symlinks
-from .exec import ToolPath, run_command
+from .exec import ToolPath
 from .http import HttpClient
 from .models import (
     Assessment,
@@ -28,6 +28,7 @@ from .models import (
     utc_now,
 )
 from .policy import Policy, cap_findings, load_structured_file
+from .provenance import capture as capture_provenance
 from .scanners.base import Scanner, ScannerContext, all_scanners
 
 ProgressCallback = Callable[[str, str], None]
@@ -182,12 +183,11 @@ class Runner:
 
     def _build_target(self) -> Target:
         config = self.config
-        commit = branch = None
-        # `git rev-parse` works from any directory inside a work tree, so a
-        # project that is a subdirectory of the repository is still traceable.
-        if config.project_path:
-            commit = self._git(["rev-parse", "HEAD"])
-            branch = self._git(["rev-parse", "--abbrev-ref", "HEAD"])
+        # Read from the project's own .git through a held descriptor, never by
+        # asking git to search for a repository: discovery walks upward, and a
+        # `.git` that is a link or a pointer names someone else's history. See
+        # `markna.provenance`.
+        provenance = capture_provenance(config.project_path)
         return Target(
             project_path=str(config.project_path) if config.project_path else None,
             architecture_docs=[str(path) for path in config.architecture_docs],
@@ -199,18 +199,10 @@ class Runner:
             environment_url=config.target_url,
             name=config.project_name
             or (config.project_path.name if config.project_path else None),
-            git_commit=commit,
-            git_branch=branch,
+            git_commit=provenance.commit,
+            git_branch=provenance.branch,
+            git_provenance_note=provenance.note,
         )
-
-    def _git(self, args: Sequence[str]) -> Optional[str]:
-        result = run_command(
-            ["git", *args],
-            cwd=self.config.project_path,
-            timeout=30,
-            tool_path=self.config.tool_path,
-        )
-        return result.stdout.strip() if result.ok and result.stdout.strip() else None
 
     # ----------------------------------------------------------------- scanners
 

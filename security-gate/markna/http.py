@@ -83,7 +83,19 @@ def _guarded_socket(
     a window in which the answer can change (DNS rebinding); connecting to an
     address that has *already* been checked closes it, because the address the
     kernel dials is the address that was approved.
+
+    The port is re-checked here for the same reason the address is: this is the
+    last point before a packet leaves the process, and it is the only check that
+    sees the port the socket will genuinely dial rather than the one a URL
+    claimed. Anything that reaches a socket without passing :meth:`Scope.check`
+    -- a handler added later, a library redirect, a bug -- still stops here.
     """
+    if not scope.port_permitted(port):
+        raise ScopeError(
+            f"port {port} on '{host}' is not authorised for this assessment "
+            f"(authorised port(s): {', '.join(str(p) for p in scope.ports) or 'none'}). "
+            "Add it to authorization.authorized_ports if testing it is permitted."
+        )
     try:
         candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:

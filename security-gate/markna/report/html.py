@@ -92,6 +92,11 @@ def render_html(assessment: Assessment) -> str:
                 ["Layers", ", ".join(layer.value for layer in assessment.layers_requested)],
                 ["Project path", assessment.target.project_path or "not assessed"],
                 ["Git commit", assessment.target.git_commit or "n/a"],
+                [
+                    "Git provenance",
+                    assessment.target.git_provenance_note
+                    or "read from the project's own .git",
+                ],
                 ["Architecture manifest", assessment.target.architecture_manifest or "none"],
                 [
                     "Architecture documents",
